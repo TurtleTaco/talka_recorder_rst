@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Lint (runs once, not per-platform)
+  # ==========================================================================
+  lint:
+    runs-on: macos-latest
+    name: Lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-lint-cargo-
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --check
+
+  # ==========================================================================
+  # Build & Test (per-platform)
+  # ==========================================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            name: macOS 13 (Ventura) Intel
+            features: "async,macos_13_0"
+          - os: macos-14
+            name: macOS 14 (Sonoma) ARM64
+            features: "async,macos_14_4"
+          - os: macos-15
+            name: macOS 15 (Sequoia) ARM64
+            features: "async,macos_15_2"
+          - os: macos-26
+            name: macOS 26 (Tahoe) ARM64
+            features: "async,macos_26_0"
+    runs-on: ${{ matrix.os }}
+    name: Build - ${{ matrix.name }}
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.os }}-cargo-
+      - name: Build (default features)
+        run: cargo build --verbose
+      - name: Build with version-specific features (${{ matrix.features }})
+        run: cargo build --verbose --features "${{ matrix.features }}"
+      - name: Run tests (default features)
+        run: cargo test --verbose
+      - name: Run tests with version-specific features
+        run: cargo test --verbose --features "${{ matrix.features }}"
+
+  # ==========================================================================
+  # Memory Leak Check (per-platform, runs parallel to build)
+  # ==========================================================================
+  leak-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            name: macOS 13 (Ventura) Intel
+            features: "async,macos_13_0"
+          - os: macos-14
+            name: macOS 14 (Sonoma) ARM64
+            features: "async,macos_14_4"
+          - os: macos-15
+            name: macOS 15 (Sequoia) ARM64
+            features: "async,macos_15_2"
+          - os: macos-26
+            name: macOS 26 (Tahoe) ARM64
+            features: "async,macos_26_0"
+    runs-on: ${{ matrix.os }}
+    name: Leak Check - ${{ matrix.name }}
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.os }}-leak-check-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.os }}-leak-check-cargo-
+      - name: Build leak check example
+        run: cargo build --example 15_memory_leak_check --features "${{ matrix.features }}"
+      - name: Run memory leak check
+        run: cargo run --example 15_memory_leak_check --features "${{ matrix.features }}"
+
+  # ==========================================================================
+  # Release (only on main, after successful build and leak-check)
+  # ==========================================================================
+  release-pr:
+    runs-on: macos-latest
+    needs: [lint, build, leak-check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: release
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache release-plz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/release-plz
+          key: ${{ runner.os }}-release-plz
+      - name: Install release-plz
+        run: command -v release-plz || cargo install release-plz
+      - name: Create release PR
+        run: release-plz release-pr --git-token ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release:
+    runs-on: macos-latest
+    needs: [lint, build, leak-check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache release-plz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/release-plz
+          key: ${{ runner.os }}-release-plz
+      - name: Install release-plz
+        run: command -v release-plz || cargo install release-plz
+      - name: Release
+        run: release-plz release --git-token ${{ secrets.RELEASE_PLZ_TOKEN }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

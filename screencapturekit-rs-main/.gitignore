@@ -1,0 +1,73 @@
+# Rust/Cargo
+# Compiled files and executables
+/target/
+debug/
+**/*.rs.bk
+Cargo.lock
+
+# Swift/Xcode
+# Swift Package Manager
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.resolved
+*.xcscmblueprint
+*.playground
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Example outputs and test artifacts
+*.jpg
+*.png
+*.raw
+*.mp4
+*.mov
+capture_output/
+test_output/
+my_screenshot.png
+picture.jpg
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Temporary files
+*.tmp
+*.bak
+.#*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Profiling and coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+
+# Documentation build
+/doc/
+/book/
+
+# Downloaded Apple documentation (regenerate with scripts/download_apple_docs.py)
+/docs/apple/
+
+# IDE-specific
+*.iml
+.project
+.classpath
+.settings/
