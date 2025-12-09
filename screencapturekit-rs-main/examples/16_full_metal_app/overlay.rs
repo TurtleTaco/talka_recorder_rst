@@ -325,7 +325,7 @@ pub fn default_stream_config() -> SCStreamConfiguration {
     SCStreamConfiguration::new()
         .with_width(1920)
         .with_height(1080)
-        .with_fps(24)
+        .with_fps(10)
         .with_shows_cursor(true)
         .with_captures_audio(true)
         .with_excludes_current_process_audio(true)

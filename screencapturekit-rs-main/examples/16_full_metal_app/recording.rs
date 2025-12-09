@@ -24,7 +24,7 @@ pub struct RecordingConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
-            codec: SCRecordingOutputCodec::HEVC,
+            codec: SCRecordingOutputCodec::H264,
             file_type: SCRecordingOutputFileType::MP4,
         }
     }
