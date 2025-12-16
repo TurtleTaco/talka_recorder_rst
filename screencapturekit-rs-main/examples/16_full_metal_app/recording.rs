@@ -11,6 +11,8 @@ use screencapturekit::stream::sc_stream::SCStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "macos_15_0")]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(feature = "macos_15_0")]
+use crate::upload::UploadStatus;
 
 /// Recording configuration state
 #[cfg(feature = "macos_15_0")]
@@ -57,12 +59,15 @@ impl RecordingConfig {
 
 /// Recording state manager
 #[cfg(feature = "macos_15_0")]
+#[derive(Clone)]
 pub struct RecordingState {
     pub output: Option<SCRecordingOutput>,
     pub path: Option<String>,
     pub is_recording: Arc<AtomicBool>,
     /// Signal when recording finishes (for waiting before opening file)
     finish_signal: Arc<(Mutex<bool>, Condvar)>,
+    /// Upload status
+    pub upload_status: Arc<Mutex<UploadStatus>>,
 }
 
 #[cfg(feature = "macos_15_0")]
@@ -73,6 +78,7 @@ impl RecordingState {
             path: None,
             is_recording: Arc::new(AtomicBool::new(false)),
             finish_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            upload_status: Arc::new(Mutex::new(UploadStatus::Idle)),
         }
     }
 
@@ -184,6 +190,54 @@ impl RecordingState {
     /// Get the recording flag for UI display
     pub fn recording_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.is_recording)
+    }
+
+    /// Upload the recorded file to storage
+    pub fn start_upload(
+        &self,
+        file_path: String,
+        access_token: String,
+        runtime: tokio::runtime::Handle,
+    ) {
+        let upload_status = Arc::clone(&self.upload_status);
+        
+        // Reset upload status
+        *upload_status.lock().unwrap() = UploadStatus::Idle;
+        
+        // Spawn upload task
+        runtime.spawn(async move {
+            use crate::upload;
+            
+            println!("🚀 Starting upload for: {}", file_path);
+            
+            let status_clone = Arc::clone(&upload_status);
+            let status_callback = Box::new(move |status: UploadStatus| {
+                *status_clone.lock().unwrap() = status;
+            });
+            
+            let file_name = std::path::Path::new(&file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            
+            match upload::upload_recording(
+                &access_token,
+                std::path::Path::new(&file_path),
+                file_name,
+                Some(status_callback),
+            )
+            .await
+            {
+                Ok(file_id) => {
+                    println!("✅ Upload complete! File ID: {}", file_id);
+                    *upload_status.lock().unwrap() = UploadStatus::Complete;
+                }
+                Err(e) => {
+                    eprintln!("❌ Upload failed: {}", e);
+                    *upload_status.lock().unwrap() = UploadStatus::Failed(e.to_string());
+                }
+            }
+        });
     }
 }
 

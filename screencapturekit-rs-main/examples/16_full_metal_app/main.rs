@@ -55,6 +55,7 @@
     clippy::cast_possible_truncation
 )]
 
+mod auth;
 mod capture;
 mod font;
 mod input;
@@ -64,12 +65,15 @@ mod recording;
 mod renderer;
 mod screenshot;
 mod ui;
+#[cfg(feature = "macos_15_0")]
+mod upload;
 mod vertex;
 mod waveform;
 
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
 
 use cocoa::appkit::NSView;
 use cocoa::base::id as cocoa_id;
@@ -102,9 +106,122 @@ use renderer::{
 use screenshot::take_screenshot;
 use vertex::{Uniforms, Vertex, VertexBufferBuilder};
 
+fn print_token_details(tokens: &auth::AuthTokens) {
+    println!("\n🔐 JWT TOKEN DETAILS");
+    println!("═══════════════════════════════════════════════════════════════════════════════");
+    println!("Token Type: {}", tokens.token_type);
+    println!("Expires In: {} seconds ({} hours)", tokens.expires_in, tokens.expires_in / 3600);
+    println!("\nAccess Token (JWT):");
+    println!("{}", tokens.access_token);
+    
+    if !tokens.id_token.is_empty() {
+        println!("\nID Token:");
+        println!("{}", tokens.id_token);
+    }
+    
+    if !tokens.refresh_token.is_empty() {
+        println!("\nRefresh Token Available: Yes");
+    }
+    
+    println!("\n💡 Use in API calls:");
+    println!("curl -H 'Authorization: Bearer {}' https://api.talka.ai/endpoint", tokens.access_token);
+    println!("═══════════════════════════════════════════════════════════════════════════════\n");
+}
+
+fn authenticate(runtime: &Runtime) -> auth::AuthTokens {
+    runtime.block_on(async {
+        // Try to load existing tokens
+        if let Some(cached_tokens) = auth::load_tokens() {
+            // If we have a refresh token, always refresh on startup
+            if !cached_tokens.refresh_token.is_empty() {
+                println!("🔄 Refreshing token on startup...");
+                match auth::refresh_access_token(&cached_tokens.refresh_token).await {
+                    Ok(new_tokens) => {
+                        // Save the refreshed tokens
+                        if let Err(e) = auth::save_tokens(&new_tokens) {
+                            eprintln!("⚠️  Failed to save refreshed tokens: {}", e);
+                        }
+                        return Ok::<auth::AuthTokens, auth::AuthError>(new_tokens);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Token refresh failed: {}", e);
+                        eprintln!("   Starting new authentication...");
+                        // Fall through to new device flow
+                    }
+                }
+            } else {
+                println!("⚠️  No refresh token available");
+                // Check if token is still valid
+                if !cached_tokens.is_expired() {
+                    println!("✅ Using cached token (valid for {} more seconds)", 
+                        cached_tokens.expires_at.saturating_sub(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs()
+                        )
+                    );
+                    return Ok::<auth::AuthTokens, auth::AuthError>(cached_tokens);
+                }
+            }
+        } else {
+            println!("ℹ️  No cached tokens found");
+        }
+
+        // No valid tokens - start new device flow
+        let tokens = auth::complete_device_flow().await?;
+        
+        // Save the new tokens
+        if let Err(e) = auth::save_tokens(&tokens) {
+            eprintln!("⚠️  Failed to save tokens: {}", e);
+        }
+        
+        Ok::<auth::AuthTokens, auth::AuthError>(tokens)
+    })
+    .expect("Authentication failed")
+}
+
+const EXIT_CODE_LOGOUT: i32 = 42; // Special exit code for logout
+
 fn main() {
-    println!("🎮 Metal Overlay Renderer");
-    println!("========================\n");
+    // Main loop - restart on logout
+    loop {
+        println!("🎮 Metal Overlay Renderer");
+        println!("========================\n");
+
+        // Create tokio runtime for auth
+        let runtime = Runtime::new().unwrap();
+
+        // Authenticate user with Auth0 Device Flow
+        println!("🔐 Checking authentication...\n");
+        let tokens = authenticate(&runtime);
+
+        println!("✅ Authentication successful!\n");
+        
+        // Print full JWT token details
+        print_token_details(&tokens);
+
+        // Run the application
+        let exit_code = run_app(tokens);
+        
+        // Check if we should restart (logout) or exit
+        if exit_code == EXIT_CODE_LOGOUT {
+            println!("\n🔄 Restarting application for re-authentication...\n");
+            continue; // Restart the loop
+        } else {
+            // Normal exit
+            break;
+        }
+    }
+}
+
+fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
+    // Store tokens in Arc<Mutex<>> so they can be updated on logout/re-auth
+    let auth_tokens = Arc::new(Mutex::new(initial_tokens));
+    
+    // Create tokio runtime for async operations (like upload)
+    let runtime = Runtime::new().unwrap();
+    let runtime_handle = runtime.handle().clone();
 
     // Create window
     let event_loop = winit::event_loop::EventLoop::new();
@@ -215,8 +332,12 @@ fn main() {
 
     println!("🎮 Press ENTER to pick a source");
 
+    // Track if we should logout (use Arc for sharing across closure)
+    let should_logout = Arc::new(AtomicBool::new(false));
+    let should_logout_clone = Arc::clone(&should_logout);
+
     // Event loop
-    event_loop.run(move |event, _, control_flow| {
+    let exit_code = event_loop.run(move |event, _, control_flow| {
         autoreleasepool(|| {
             *control_flow = ControlFlow::Poll;
 
@@ -349,7 +470,38 @@ fn main() {
                                             {
                                                 if recording_state.is_active() {
                                                     if let Some(ref s) = stream {
-                                                        recording_state.stop(s);
+                                                        if let Some(file_path) = recording_state.stop(s) {
+                                                            // Refresh token and upload
+                                                            let tokens = auth_tokens.lock().unwrap().clone();
+                                                            let runtime_clone = runtime_handle.clone();
+                                                            let recording_state_clone = recording_state.clone();
+                                                            
+                                                            runtime_handle.spawn(async move {
+                                                                // Refresh access token
+                                                                let access_token = if tokens.is_expired() {
+                                                                    println!("🔄 Refreshing access token before upload...");
+                                                                    match auth::refresh_access_token(&tokens.refresh_token).await {
+                                                                        Ok(new_tokens) => {
+                                                                            println!("✅ Token refreshed");
+                                                                            new_tokens.access_token
+                                                                        }
+                                                                        Err(e) => {
+                                                                            eprintln!("❌ Token refresh failed: {}", e);
+                                                                            tokens.access_token
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    tokens.access_token
+                                                                };
+                                                                
+                                                                // Start upload
+                                                                recording_state_clone.start_upload(
+                                                                    file_path,
+                                                                    access_token,
+                                                                    runtime_clone,
+                                                                );
+                                                            });
+                                                        }
                                                     }
                                                 } else if stream.is_some() {
                                                     if let Some(ref s) = stream {
@@ -376,6 +528,18 @@ fn main() {
                                                 overlay.show_recording_config = true;
                                                 overlay.show_help = false;
                                             }
+                                        }
+                                        "Logout" => {
+                                            println!("\n🚪 Logging out...");
+                                            if let Err(e) = auth::logout() {
+                                                eprintln!("⚠️  Logout error: {}", e);
+                                            }
+                                            println!("✅ Logged out successfully!");
+                                            println!("🔒 Closing window for re-authentication...\n");
+                                            
+                                            // Signal logout and exit with special code
+                                            should_logout_clone.store(true, Ordering::Relaxed);
+                                            *control_flow = ControlFlow::ExitWithCode(EXIT_CODE_LOGOUT);
                                         }
                                         "Quit" => {
                                             *control_flow = ControlFlow::ExitWithCode(0);
@@ -568,7 +732,38 @@ fn main() {
                                         if recording_state.is_active() {
                                             // Stop recording
                                             if let Some(ref s) = stream {
-                                                recording_state.stop(s);
+                                                if let Some(file_path) = recording_state.stop(s) {
+                                                    // Refresh token and upload
+                                                    let tokens = auth_tokens.lock().unwrap().clone();
+                                                    let runtime_clone = runtime_handle.clone();
+                                                    let recording_state_clone = recording_state.clone();
+                                                    
+                                                    runtime_handle.spawn(async move {
+                                                        // Refresh access token
+                                                        let access_token = if tokens.is_expired() {
+                                                            println!("🔄 Refreshing access token before upload...");
+                                                            match auth::refresh_access_token(&tokens.refresh_token).await {
+                                                                Ok(new_tokens) => {
+                                                                    println!("✅ Token refreshed");
+                                                                    new_tokens.access_token
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("❌ Token refresh failed: {}", e);
+                                                                    tokens.access_token
+                                                                }
+                                                            }
+                                                        } else {
+                                                            tokens.access_token
+                                                        };
+                                                        
+                                                        // Start upload
+                                                        recording_state_clone.start_upload(
+                                                            file_path,
+                                                            access_token,
+                                                            runtime_clone,
+                                                        );
+                                                    });
+                                                }
                                             }
                                         } else if current_filter.is_some() && stream.is_some() {
                                             // Start recording
@@ -794,6 +989,13 @@ fn main() {
                         );
                     }
 
+                    // Upload status overlay (macOS 15.0+)
+                    #[cfg(feature = "macos_15_0")]
+                    {
+                        let upload_status = recording_state.upload_status.lock().unwrap().clone();
+                        vertex_builder.upload_status_overlay(&font, width, height, &upload_status);
+                    }
+
                     // Build GPU buffer
                     let vertex_buffer = vertex_builder.build(&device);
                     vertex_buffer.did_modify_range(metal::NSRange::new(
@@ -870,4 +1072,11 @@ fn main() {
             }
         });
     });
+    
+    // Return the exit code
+    if should_logout.load(Ordering::Relaxed) {
+        EXIT_CODE_LOGOUT
+    } else {
+        0
+    }
 }

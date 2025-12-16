@@ -12,6 +12,8 @@ use screencapturekit::prelude::*;
 use crate::font::BitmapFont;
 use crate::overlay::ConfigMenu;
 use crate::vertex::VertexBufferBuilder;
+#[cfg(feature = "macos_15_0")]
+use crate::upload::UploadStatus;
 
 // Synthwave color constants
 const NEON_PINK: [f32; 4] = [1.0, 0.2, 0.6, 1.0];
@@ -413,5 +415,77 @@ impl VertexBufferBuilder {
             scale * 0.6,
             [0.5, 0.4, 0.6, 1.0],
         );
+    }
+
+    /// Upload status overlay (bottom-right corner)
+    #[cfg(feature = "macos_15_0")]
+    pub fn upload_status_overlay(
+        &mut self,
+        font: &BitmapFont,
+        vw: f32,
+        vh: f32,
+        upload_status: &UploadStatus,
+    ) {
+        // Skip if idle
+        if matches!(upload_status, UploadStatus::Idle) {
+            return;
+        }
+
+        let base_scale = (vw.min(vh) / 800.0).clamp(0.8, 2.0);
+        let scale = 1.2 * base_scale;
+        let line_h = 16.0 * base_scale;
+        let padding = 12.0 * base_scale;
+
+        // Determine color based on status
+        let (status_color, bg_color): ([f32; 4], [f32; 4]) = match upload_status {
+            UploadStatus::Idle => return,
+            UploadStatus::CreatingFile | UploadStatus::UploadingFile { .. } | UploadStatus::CreatingMetadata => {
+                (NEON_CYAN, [0.04, 0.08, 0.1, 0.95])
+            }
+            UploadStatus::Complete => ([0.3, 1.0, 0.5, 1.0], [0.04, 0.1, 0.06, 0.95]),
+            UploadStatus::Failed(_) => ([1.0, 0.3, 0.3, 1.0], [0.1, 0.02, 0.02, 0.95]),
+        };
+
+        let status_text = upload_status.as_display_string();
+        let actual_scale = (scale as i32) as f32;
+        let text_w = status_text.len() as f32 * 8.0 * actual_scale;
+        let box_w = text_w + padding * 2.0;
+        let box_h = line_h + padding * 1.5;
+
+        // Position at bottom-right
+        let x = vw - box_w - 16.0;
+        let y = vh - box_h - 16.0;
+
+        // Background box
+        self.rect(x, y, box_w, box_h, bg_color);
+        self.rect_outline(x, y, box_w, box_h, 2.0, status_color);
+
+        // Icon
+        let icon = match upload_status {
+            UploadStatus::CreatingFile | UploadStatus::UploadingFile { .. } | UploadStatus::CreatingMetadata => {
+                "↑"
+            }
+            UploadStatus::Complete => "✓",
+            UploadStatus::Failed(_) => "✗",
+            UploadStatus::Idle => "",
+        };
+
+        let icon_x = x + padding * 0.5;
+        let text_y = y + (box_h - 8.0 * actual_scale) / 2.0;
+        
+        if !icon.is_empty() {
+            self.text(font, icon, icon_x, text_y, scale, status_color);
+        }
+
+        // Status text
+        let text_x = icon_x + 12.0 * base_scale;
+        self.text(font, &status_text, text_x, text_y, scale * 0.8, status_color);
+
+        // Progress bar for uploading
+        if let UploadStatus::UploadingFile { percent } = upload_status {
+            let bar_y = y + box_h - 3.0;
+            let bar_w = box_w * (*percent as f32 / 100.0);
+            self.rect(x, bar_y, bar_w, 2.0, NEON_CYAN);
+        }
     }
 }

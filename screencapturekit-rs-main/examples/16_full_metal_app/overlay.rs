@@ -42,7 +42,7 @@ impl OverlayState {
     }
 
     /// Menu items for initial state (no source picked)
-    pub const MENU_ITEMS_INITIAL: &'static [&'static str] = &["Pick Source", "Quit"];
+    pub const MENU_ITEMS_INITIAL: &'static [&'static str] = &["Pick Source", "Logout", "Quit"];
 
     /// Menu items for full state (after source picked) - macOS 15.0+
     #[cfg(feature = "macos_15_0")]
@@ -53,13 +53,14 @@ impl OverlayState {
         "Config",
         "Rec Config",
         "Change Source",
+        "Logout",
         "Quit",
     ];
 
     /// Menu items for full state (after source picked) - pre-macOS 15.0
     #[cfg(not(feature = "macos_15_0"))]
     pub const MENU_ITEMS_FULL: &'static [&'static str] =
-        &["Capture", "Screenshot", "Config", "Change Source", "Quit"];
+        &["Capture", "Screenshot", "Config", "Change Source", "Logout", "Quit"];
 
     /// Get current menu items based on mode
     pub fn menu_items(&self) -> &'static [&'static str] {
