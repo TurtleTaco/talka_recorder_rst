@@ -55,16 +55,28 @@ macos_26_0 = ["macos_15_2"]
 
 [dependencies]
 cpal = { version = "0.15", optional = true }
+futures = "0.3.31"
+openid = "0.15.0"
+tokio-stream = "0.1.17"
+warp = { version = "0.4.2", features = ["server"] }
 
 [dev-dependencies]
 png = "0.17"
-tokio = { version = "1.40", features = ["sync", "rt", "rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1.40", features = ["sync", "rt", "rt-multi-thread", "macros", "test-util", "fs"] }
 metal = "0.29"
 cocoa = "0.25"
 core-graphics-types = "0.1"
 objc = "0.2"
 winit = "0.28"
 raw-window-handle = "0.5"
+talka_agent = { path = "../talka_agent" }
+anyhow = "1.0"
+env_logger = "0.11"
+log = "0.4"
+reqwest = { version = "0.11", features = ["json", "multipart"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
 
 [package.metadata.docs.rs]
 # Build documentation with all features enabled
@@ -78,4 +90,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[example]]
 name = "16_full_metal_app"
 path = "examples/16_full_metal_app/main.rs"
+required-features = ["macos_14_0"]
+
+[[example]]
+name = "17_livekit_recorder"
+path = "examples/17_livekit_recorder/main.rs"
 required-features = ["macos_14_0"]
