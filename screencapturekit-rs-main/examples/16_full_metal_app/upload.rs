@@ -254,7 +254,7 @@ pub async fn upload_recording(
     
     // Spawn progress updater
     if let Some(ref cb) = status_callback {
-        let cb_clone = cb.clone();
+        let _cb_clone = cb;
         tokio::spawn(async move {
             loop {
                 let percent = progress_clone.load(Ordering::Relaxed);

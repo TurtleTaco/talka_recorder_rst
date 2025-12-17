@@ -24,6 +24,189 @@ const NEON_YELLOW: [f32; 4] = [1.0, 0.95, 0.3, 1.0];
 const DARK_BG: [f32; 4] = [0.04, 0.02, 0.08, 0.95];
 
 impl VertexBufferBuilder {
+    /// Authentication screen overlay
+    pub fn auth_overlay(
+        &mut self,
+        font: &BitmapFont,
+        vw: f32,
+        vh: f32,
+        state: &str,
+        verification_uri: Option<&str>,
+        user_code: Option<&str>,
+    ) {
+        let base_scale = (vw.min(vh) / 800.0).clamp(0.8, 2.0);
+        let scale = 1.5 * base_scale;
+        let line_h = 18.0 * base_scale;
+        let padding = 16.0 * base_scale;
+
+        // Calculate box size based on content
+        let box_w = (400.0 * base_scale).min(vw * 0.9);
+        let box_h = if verification_uri.is_some() {
+            (line_h * 12.0 + padding * 2.0).min(vh * 0.85)
+        } else {
+            (line_h * 5.0 + padding * 2.0).min(vh * 0.5)
+        };
+        let x = (vw - box_w) / 2.0;
+        let y = (vh - box_h) / 2.0;
+
+        // Dark background with neon border
+        self.rect(x, y, box_w, box_h, DARK_BG);
+        self.rect_outline(x, y, box_w, box_h, 2.0, NEON_CYAN);
+        self.rect_outline(
+            x + 1.0,
+            y + 1.0,
+            box_w - 2.0,
+            box_h - 2.0,
+            1.0,
+            [0.1, 0.3, 0.4, 0.5],
+        );
+
+        let mut ly = y + padding;
+        let text_x = x + padding;
+
+        // Title
+        let title = "Talka Authentication";
+        let title_scale = scale * 1.4;
+        let title_w = title.len() as f32 * 8.0 * title_scale;
+        let title_x = (vw - title_w) / 2.0;
+        self.text(font, title, title_x, ly, title_scale, NEON_PINK);
+        ly += line_h * 2.0;
+
+        // Separator
+        self.rect(
+            x + padding,
+            ly - 4.0,
+            box_w - padding * 2.0,
+            1.0,
+            NEON_PURPLE,
+        );
+        ly += line_h * 0.5;
+
+        match state {
+            "checking" => {
+                self.text(
+                    font,
+                    "Checking saved credentials...",
+                    text_x,
+                    ly,
+                    scale,
+                    [0.8, 0.8, 0.9, 1.0],
+                );
+            }
+            "needs_auth" => {
+                if let (Some(uri), Some(code)) = (verification_uri, user_code) {
+                    // Instructions
+                    self.text(
+                        font,
+                        "Please sign in:",
+                        text_x,
+                        ly,
+                        scale * 1.1,
+                        NEON_YELLOW,
+                    );
+                    ly += line_h * 2.0;
+
+                    self.text(
+                        font,
+                        "1. Open this URL in your browser:",
+                        text_x,
+                        ly,
+                        scale * 0.9,
+                        [0.8, 0.8, 0.9, 1.0],
+                    );
+                    ly += line_h * 1.3;
+
+                    // URL box
+                    let url_padding = 8.0 * base_scale;
+                    self.rect(
+                        text_x - url_padding,
+                        ly - 2.0,
+                        box_w - padding * 2.0 + url_padding * 2.0,
+                        line_h * 1.2,
+                        [0.1, 0.1, 0.15, 0.9],
+                    );
+                    self.text(font, uri, text_x, ly, scale, NEON_CYAN);
+                    ly += line_h * 2.0;
+
+                    self.text(
+                        font,
+                        "2. Enter this code:",
+                        text_x,
+                        ly,
+                        scale * 0.9,
+                        [0.8, 0.8, 0.9, 1.0],
+                    );
+                    ly += line_h * 1.3;
+
+                    // Code box - centered and larger
+                    let code_scale = scale * 1.8;
+                    let code_w = code.len() as f32 * 8.0 * code_scale;
+                    let code_x = (vw - code_w) / 2.0;
+                    self.rect(
+                        code_x - padding,
+                        ly - 4.0,
+                        code_w + padding * 2.0,
+                        line_h * 1.8,
+                        [0.15, 0.05, 0.25, 0.95],
+                    );
+                    self.rect_outline(
+                        code_x - padding,
+                        ly - 4.0,
+                        code_w + padding * 2.0,
+                        line_h * 1.8,
+                        2.0,
+                        NEON_YELLOW,
+                    );
+                    self.text(font, code, code_x, ly, code_scale, NEON_YELLOW);
+                    ly += line_h * 2.5;
+
+                    // Waiting message
+                    let wait_msg = "Waiting for authentication...";
+                    let wait_w = wait_msg.len() as f32 * 8.0 * scale * 0.9;
+                    let wait_x = (vw - wait_w) / 2.0;
+                    self.text(
+                        font,
+                        wait_msg,
+                        wait_x,
+                        ly,
+                        scale * 0.9,
+                        [0.5, 0.7, 1.0, 0.8],
+                    );
+                }
+            }
+            "authenticating" => {
+                self.text(
+                    font,
+                    "Completing authentication...",
+                    text_x,
+                    ly,
+                    scale,
+                    NEON_YELLOW,
+                );
+            }
+            "error" => {
+                self.text(
+                    font,
+                    "Authentication failed",
+                    text_x,
+                    ly,
+                    scale,
+                    [1.0, 0.3, 0.3, 1.0],
+                );
+                ly += line_h * 1.5;
+                self.text(
+                    font,
+                    "Press Q to quit",
+                    text_x,
+                    ly,
+                    scale * 0.8,
+                    [0.7, 0.7, 0.8, 1.0],
+                );
+            }
+            _ => {}
+        }
+    }
+
     pub fn help_overlay(
         &mut self,
         font: &BitmapFont,

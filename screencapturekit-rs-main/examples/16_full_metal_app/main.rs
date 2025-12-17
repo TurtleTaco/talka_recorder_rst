@@ -106,79 +106,14 @@ use renderer::{
 use screenshot::take_screenshot;
 use vertex::{Uniforms, Vertex, VertexBufferBuilder};
 
-fn print_token_details(tokens: &auth::AuthTokens) {
-    println!("\n🔐 JWT TOKEN DETAILS");
-    println!("═══════════════════════════════════════════════════════════════════════════════");
-    println!("Token Type: {}", tokens.token_type);
-    println!("Expires In: {} seconds ({} hours)", tokens.expires_in, tokens.expires_in / 3600);
-    println!("\nAccess Token (JWT):");
-    println!("{}", tokens.access_token);
-    
-    if !tokens.id_token.is_empty() {
-        println!("\nID Token:");
-        println!("{}", tokens.id_token);
-    }
-    
-    if !tokens.refresh_token.is_empty() {
-        println!("\nRefresh Token Available: Yes");
-    }
-    
-    println!("\n💡 Use in API calls:");
-    println!("curl -H 'Authorization: Bearer {}' https://api.talka.ai/endpoint", tokens.access_token);
-    println!("═══════════════════════════════════════════════════════════════════════════════\n");
-}
-
-fn authenticate(runtime: &Runtime) -> auth::AuthTokens {
-    runtime.block_on(async {
-        // Try to load existing tokens
-        if let Some(cached_tokens) = auth::load_tokens() {
-            // If we have a refresh token, always refresh on startup
-            if !cached_tokens.refresh_token.is_empty() {
-                println!("🔄 Refreshing token on startup...");
-                match auth::refresh_access_token(&cached_tokens.refresh_token).await {
-                    Ok(new_tokens) => {
-                        // Save the refreshed tokens
-                        if let Err(e) = auth::save_tokens(&new_tokens) {
-                            eprintln!("⚠️  Failed to save refreshed tokens: {}", e);
-                        }
-                        return Ok::<auth::AuthTokens, auth::AuthError>(new_tokens);
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Token refresh failed: {}", e);
-                        eprintln!("   Starting new authentication...");
-                        // Fall through to new device flow
-                    }
-                }
-            } else {
-                println!("⚠️  No refresh token available");
-                // Check if token is still valid
-                if !cached_tokens.is_expired() {
-                    println!("✅ Using cached token (valid for {} more seconds)", 
-                        cached_tokens.expires_at.saturating_sub(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                        )
-                    );
-                    return Ok::<auth::AuthTokens, auth::AuthError>(cached_tokens);
-                }
-            }
-        } else {
-            println!("ℹ️  No cached tokens found");
-        }
-
-        // No valid tokens - start new device flow
-        let tokens = auth::complete_device_flow().await?;
-        
-        // Save the new tokens
-        if let Err(e) = auth::save_tokens(&tokens) {
-            eprintln!("⚠️  Failed to save tokens: {}", e);
-        }
-        
-        Ok::<auth::AuthTokens, auth::AuthError>(tokens)
-    })
-    .expect("Authentication failed")
+// Authentication state for UI-based auth flow
+#[derive(Debug, Clone)]
+enum AuthState {
+    CheckingCache,
+    NeedsAuth { verification_uri: String, user_code: String, device_code: String, poll_interval: u64 },
+    Authenticating,
+    Authenticated(auth::AuthTokens),
+    Error(String),
 }
 
 const EXIT_CODE_LOGOUT: i32 = 42; // Special exit code for logout
@@ -186,27 +121,11 @@ const EXIT_CODE_LOGOUT: i32 = 42; // Special exit code for logout
 fn main() {
     // Main loop - restart on logout
     loop {
-        println!("🎮 Metal Overlay Renderer");
-        println!("========================\n");
-
-        // Create tokio runtime for auth
-        let runtime = Runtime::new().unwrap();
-
-        // Authenticate user with Auth0 Device Flow
-        println!("🔐 Checking authentication...\n");
-        let tokens = authenticate(&runtime);
-
-        println!("✅ Authentication successful!\n");
-        
-        // Print full JWT token details
-        print_token_details(&tokens);
-
-        // Run the application
-        let exit_code = run_app(tokens);
+        // Run the application (auth happens inside the UI now)
+        let exit_code = run_app();
         
         // Check if we should restart (logout) or exit
         if exit_code == EXIT_CODE_LOGOUT {
-            println!("\n🔄 Restarting application for re-authentication...\n");
             continue; // Restart the loop
         } else {
             // Normal exit
@@ -215,13 +134,14 @@ fn main() {
     }
 }
 
-fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
-    // Store tokens in Arc<Mutex<>> so they can be updated on logout/re-auth
-    let auth_tokens = Arc::new(Mutex::new(initial_tokens));
-    
-    // Create tokio runtime for async operations (like upload)
+fn run_app() -> i32 {
+    // Create tokio runtime for async operations (auth, upload)
     let runtime = Runtime::new().unwrap();
     let runtime_handle = runtime.handle().clone();
+    
+    // Start with checking cache state
+    let auth_state = Arc::new(Mutex::new(AuthState::CheckingCache));
+    let auth_tokens: Arc<Mutex<Option<auth::AuthTokens>>> = Arc::new(Mutex::new(None));
 
     // Create window
     let event_loop = winit::event_loop::EventLoop::new();
@@ -330,55 +250,136 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
     let mut vertex_builder = VertexBufferBuilder::new();
     let mut time = 0.0f32;
 
-    println!("🎮 Press ENTER to pick a source");
-
     // Track if we should logout (use Arc for sharing across closure)
     let should_logout = Arc::new(AtomicBool::new(false));
     let should_logout_clone = Arc::clone(&should_logout);
+    let exit_code_ref = Arc::new(Mutex::new(0i32));
+    let exit_code_clone = Arc::clone(&exit_code_ref);
+
+    // Start authentication check in background
+    {
+        let auth_state_clone = Arc::clone(&auth_state);
+        let auth_tokens_clone = Arc::clone(&auth_tokens);
+        let runtime_clone = runtime_handle.clone();
+        
+        runtime_handle.spawn(async move {
+            // Try to load existing tokens
+            if let Some(cached_tokens) = auth::load_tokens() {
+                // If we have a refresh token, try to refresh
+                if !cached_tokens.refresh_token.is_empty() {
+                    match auth::refresh_access_token(&cached_tokens.refresh_token).await {
+                        Ok(new_tokens) => {
+                            // Save the refreshed tokens
+                            let _ = auth::save_tokens(&new_tokens);
+                            *auth_state_clone.lock().unwrap() = 
+                                AuthState::Authenticated(new_tokens.clone());
+                            *auth_tokens_clone.lock().unwrap() = Some(new_tokens);
+                            return;
+                        }
+                        Err(_) => {
+                            // Refresh failed, need new auth
+                        }
+                    }
+                } else if !cached_tokens.is_expired() {
+                    // Valid cached token
+                    *auth_state_clone.lock().unwrap() = 
+                        AuthState::Authenticated(cached_tokens.clone());
+                    *auth_tokens_clone.lock().unwrap() = Some(cached_tokens);
+                    return;
+                }
+            }
+
+            // No valid tokens - start device flow
+            match auth::start_device_flow().await {
+                Ok((verification_uri, user_code, device_response)) => {
+                    *auth_state_clone.lock().unwrap() = AuthState::NeedsAuth {
+                        verification_uri: verification_uri.clone(),
+                        user_code: user_code.clone(),
+                        device_code: device_response.device_code.clone(),
+                        poll_interval: device_response.interval,
+                    };
+
+                    // Start polling for token
+                    let device_code = device_response.device_code.clone();
+                    let poll_interval = device_response.interval;
+                    
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval)).await;
+                        
+                        match auth::poll_for_token(&device_code).await {
+                            Ok(mut tokens) => {
+                                tokens.update_expiration();
+                                let _ = auth::save_tokens(&tokens);
+                                *auth_state_clone.lock().unwrap() = 
+                                    AuthState::Authenticated(tokens.clone());
+                                *auth_tokens_clone.lock().unwrap() = Some(tokens);
+                                break;
+                            }
+                            Err(auth::AuthError::AuthorizationPending) => {
+                                // Keep waiting
+                                continue;
+                            }
+                            Err(auth::AuthError::SlowDown) => {
+                                // Slow down polling
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                *auth_state_clone.lock().unwrap() = 
+                                    AuthState::Error(format!("{}", e));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    *auth_state_clone.lock().unwrap() = AuthState::Error(format!("{}", e));
+                }
+            }
+        });
+    }
 
     // Event loop
-    let exit_code = event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, _, control_flow| {
         autoreleasepool(|| {
             *control_flow = ControlFlow::Poll;
 
-            // Check for pending picker results - auto-start capture after picking
-            if let Ok(mut pending) = pending_picker.try_lock() {
-                if let Some((filter, width, height, source)) = pending.take() {
-                    println!(
-                        "✅ Content selected: {}x{} - {}",
-                        width,
-                        height,
-                        format_picked_source(&source)
-                    );
-                    // Force 720p recording, do not change the capture size by the screen size
-                    // capture_size = (width, height);
-                    picked_source = source;
+            // Check authentication state
+            let current_auth_state = auth_state.lock().unwrap().clone();
+            let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
 
-                    // If already capturing, update the filter live
-                    if capturing.load(Ordering::Relaxed) {
-                        if let Some(ref s) = stream {
-                            match s.update_content_filter(&filter) {
-                                Ok(()) => println!("✅ Source updated live"),
-                                Err(e) => eprintln!("❌ Failed to update source: {e:?}"),
+            // Only process picker results and normal app logic when authenticated
+            if is_authenticated {
+                // Check for pending picker results - auto-start capture after picking
+                if let Ok(mut pending) = pending_picker.try_lock() {
+                    if let Some((filter, width, height, source)) = pending.take() {
+                        // Force 720p recording, do not change the capture size by the screen size
+                        // capture_size = (width, height);
+                        picked_source = source;
+
+                        // If already capturing, update the filter live
+                        if capturing.load(Ordering::Relaxed) {
+                            if let Some(ref s) = stream {
+                                let _ = s.update_content_filter(&filter);
                             }
+                            current_filter = Some(filter);
+                        } else {
+                            // Auto-start capture after picking
+                            current_filter = Some(filter);
+                            start_capture(
+                                &mut stream,
+                                current_filter.as_ref(),
+                                capture_size,
+                                &stream_config,
+                                &capture_state,
+                                &capturing,
+                                false,
+                            );
                         }
-                        current_filter = Some(filter);
-                    } else {
-                        // Auto-start capture after picking
-                        current_filter = Some(filter);
-                        start_capture(
-                            &mut stream,
-                            current_filter.as_ref(),
-                            capture_size,
-                            &stream_config,
-                            &capture_state,
-                            &capturing,
-                            false,
-                        );
-                    }
 
-                    // Switch to full menu mode
-                    overlay.switch_to_full_menu();
+                        // Switch to full menu mode
+                        overlay.switch_to_full_menu();
+                    }
                 }
             }
 
@@ -386,7 +387,10 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                 Event::MainEventsCleared => window.request_redraw(),
 
                 Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => *control_flow = ControlFlow::ExitWithCode(0),
+                    WindowEvent::CloseRequested => {
+                        *exit_code_clone.lock().unwrap() = 0;
+                        *control_flow = ControlFlow::Exit;
+                    },
 
                     WindowEvent::Resized(size) => {
                         layer.set_drawable_size(CGSize::new(f64::from(size.width), f64::from(size.height)));
@@ -401,6 +405,19 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                             },
                         ..
                     } => {
+                        // Check if authenticated before processing keys
+                        let current_auth_state = auth_state.lock().unwrap().clone();
+                        let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
+
+                        // If not authenticated, only allow quit
+                        if !is_authenticated {
+                            if matches!(keycode, VirtualKeyCode::Q | VirtualKeyCode::Escape) {
+                                *exit_code_clone.lock().unwrap() = 0;
+                                *control_flow = ControlFlow::Exit;
+                            }
+                            return;
+                        }
+
                         // Handle menu navigation when help is shown
                         #[cfg(feature = "macos_15_0")]
                         let show_any_config = overlay.show_config || overlay.show_recording_config;
@@ -472,35 +489,30 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                                     if let Some(ref s) = stream {
                                                         if let Some(file_path) = recording_state.stop(s) {
                                                             // Refresh token and upload
-                                                            let tokens = auth_tokens.lock().unwrap().clone();
-                                                            let runtime_clone = runtime_handle.clone();
-                                                            let recording_state_clone = recording_state.clone();
-                                                            
-                                                            runtime_handle.spawn(async move {
-                                                                // Refresh access token
-                                                                let access_token = if tokens.is_expired() {
-                                                                    println!("🔄 Refreshing access token before upload...");
-                                                                    match auth::refresh_access_token(&tokens.refresh_token).await {
-                                                                        Ok(new_tokens) => {
-                                                                            println!("✅ Token refreshed");
-                                                                            new_tokens.access_token
-                                                                        }
-                                                                        Err(e) => {
-                                                                            eprintln!("❌ Token refresh failed: {}", e);
-                                                                            tokens.access_token
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    tokens.access_token
-                                                                };
+                                                            let tokens_opt = auth_tokens.lock().unwrap().clone();
+                                                            if let Some(tokens) = tokens_opt {
+                                                                let runtime_clone = runtime_handle.clone();
+                                                                let recording_state_clone = recording_state.clone();
                                                                 
-                                                                // Start upload
-                                                                recording_state_clone.start_upload(
-                                                                    file_path,
-                                                                    access_token,
-                                                                    runtime_clone,
-                                                                );
-                                                            });
+                                                                runtime_handle.spawn(async move {
+                                                                    // Refresh access token if needed
+                                                                    let access_token = if tokens.is_expired() {
+                                                                        match auth::refresh_access_token(&tokens.refresh_token).await {
+                                                                            Ok(new_tokens) => new_tokens.access_token,
+                                                                            Err(_) => tokens.access_token,
+                                                                        }
+                                                                    } else {
+                                                                        tokens.access_token
+                                                                    };
+                                                                    
+                                                                    // Start upload
+                                                                    recording_state_clone.start_upload(
+                                                                        file_path,
+                                                                        access_token,
+                                                                        runtime_clone,
+                                                                    );
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                 } else if stream.is_some() {
@@ -530,19 +542,16 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                             }
                                         }
                                         "Logout" => {
-                                            println!("\n🚪 Logging out...");
-                                            if let Err(e) = auth::logout() {
-                                                eprintln!("⚠️  Logout error: {}", e);
-                                            }
-                                            println!("✅ Logged out successfully!");
-                                            println!("🔒 Closing window for re-authentication...\n");
+                                            let _ = auth::logout();
                                             
                                             // Signal logout and exit with special code
                                             should_logout_clone.store(true, Ordering::Relaxed);
-                                            *control_flow = ControlFlow::ExitWithCode(EXIT_CODE_LOGOUT);
+                                            *exit_code_clone.lock().unwrap() = EXIT_CODE_LOGOUT;
+                                            *control_flow = ControlFlow::Exit;
                                         }
                                         "Quit" => {
-                                            *control_flow = ControlFlow::ExitWithCode(0);
+                                            *exit_code_clone.lock().unwrap() = 0;
+                                            *control_flow = ControlFlow::Exit;
                                         }
                                         _ => {}
                                     }
@@ -551,7 +560,8 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                     overlay.show_help = false;
                                 }
                                 VirtualKeyCode::Q => {
-                                    *control_flow = ControlFlow::ExitWithCode(0);
+                                    *exit_code_clone.lock().unwrap() = 0;
+                                    *control_flow = ControlFlow::Exit;
                                 }
                                 _ => {}
                             }
@@ -614,7 +624,8 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                     overlay.show_help = true;
                                 }
                                 VirtualKeyCode::Q => {
-                                    *control_flow = ControlFlow::ExitWithCode(0);
+                                    *exit_code_clone.lock().unwrap() = 0;
+                                    *control_flow = ControlFlow::Exit;
                                 }
                                 _ => {}
                             }
@@ -656,7 +667,8 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                     overlay.show_help = true;
                                 }
                                 VirtualKeyCode::Q => {
-                                    *control_flow = ControlFlow::ExitWithCode(0);
+                                    *exit_code_clone.lock().unwrap() = 0;
+                                    *control_flow = ControlFlow::Exit;
                                 }
                                 _ => {}
                             }
@@ -734,35 +746,30 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                             if let Some(ref s) = stream {
                                                 if let Some(file_path) = recording_state.stop(s) {
                                                     // Refresh token and upload
-                                                    let tokens = auth_tokens.lock().unwrap().clone();
-                                                    let runtime_clone = runtime_handle.clone();
-                                                    let recording_state_clone = recording_state.clone();
-                                                    
-                                                    runtime_handle.spawn(async move {
-                                                        // Refresh access token
-                                                        let access_token = if tokens.is_expired() {
-                                                            println!("🔄 Refreshing access token before upload...");
-                                                            match auth::refresh_access_token(&tokens.refresh_token).await {
-                                                                Ok(new_tokens) => {
-                                                                    println!("✅ Token refreshed");
-                                                                    new_tokens.access_token
-                                                                }
-                                                                Err(e) => {
-                                                                    eprintln!("❌ Token refresh failed: {}", e);
-                                                                    tokens.access_token
-                                                                }
-                                                            }
-                                                        } else {
-                                                            tokens.access_token
-                                                        };
+                                                    let tokens_opt = auth_tokens.lock().unwrap().clone();
+                                                    if let Some(tokens) = tokens_opt {
+                                                        let runtime_clone = runtime_handle.clone();
+                                                        let recording_state_clone = recording_state.clone();
                                                         
-                                                        // Start upload
-                                                        recording_state_clone.start_upload(
-                                                            file_path,
-                                                            access_token,
-                                                            runtime_clone,
-                                                        );
-                                                    });
+                                                        runtime_handle.spawn(async move {
+                                                            // Refresh access token if needed
+                                                            let access_token = if tokens.is_expired() {
+                                                                match auth::refresh_access_token(&tokens.refresh_token).await {
+                                                                    Ok(new_tokens) => new_tokens.access_token,
+                                                                    Err(_) => tokens.access_token,
+                                                                }
+                                                            } else {
+                                                                tokens.access_token
+                                                            };
+                                                            
+                                                            // Start upload
+                                                            recording_state_clone.start_upload(
+                                                                file_path,
+                                                                access_token,
+                                                                runtime_clone,
+                                                            );
+                                                        });
+                                                    }
                                                 }
                                             }
                                         } else if current_filter.is_some() && stream.is_some() {
@@ -773,17 +780,16 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                                                     Err(e) => eprintln!("❌ {e}"),
                                                 }
                                             }
-                                        } else {
-                                            println!("⚠️  Start capture first (P then Space), then R to record");
                                         }
                                     }
                                     #[cfg(not(feature = "macos_15_0"))]
                                     {
-                                        println!("⚠️  Recording requires macOS 15.0+ (macos_15_0 feature)");
+                                        // Recording not available
                                     }
                                 }
                                 VirtualKeyCode::Escape | VirtualKeyCode::Q => {
-                                    *control_flow = ControlFlow::ExitWithCode(0);
+                                    *exit_code_clone.lock().unwrap() = 0;
+                                    *control_flow = ControlFlow::Exit;
                                 }
                                 _ => {}
                             }
@@ -799,13 +805,17 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                     let width = size.width as f32;
                     let height = size.height as f32;
 
+                    // Check authentication state
+                    let current_auth_state = auth_state.lock().unwrap().clone();
+                    let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
+
                     // Try to get the latest IOSurface and create textures from it (zero-copy)
                     let mut capture_textures: Option<CaptureTextures> = None;
                     let mut tex_width = capture_size.0 as f32;
                     let mut tex_height = capture_size.1 as f32;
                     let mut pixel_format: u32 = 0;
 
-                    if capturing.load(Ordering::Relaxed) {
+                    if is_authenticated && capturing.load(Ordering::Relaxed) {
                         if let Ok(guard) = capture_state.latest_surface.try_lock() {
                             if let Some(ref surface) = *guard {
                                 tex_width = surface.width() as f32;
@@ -823,6 +833,35 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
 
                     // Build vertex buffer for this frame
                     vertex_builder.clear();
+
+                    // Show authentication screen if not authenticated
+                    if !is_authenticated {
+                        match current_auth_state {
+                            AuthState::CheckingCache => {
+                                vertex_builder.auth_overlay(&font, width, height, "checking", None, None);
+                            }
+                            AuthState::NeedsAuth { ref verification_uri, ref user_code, .. } => {
+                                vertex_builder.auth_overlay(
+                                    &font, 
+                                    width, 
+                                    height, 
+                                    "needs_auth", 
+                                    Some(verification_uri), 
+                                    Some(user_code)
+                                );
+                            }
+                            AuthState::Authenticating => {
+                                vertex_builder.auth_overlay(&font, width, height, "authenticating", None, None);
+                            }
+                            AuthState::Error(_) => {
+                                vertex_builder.auth_overlay(&font, width, height, "error", None, None);
+                            }
+                            AuthState::Authenticated(_) => {
+                                // Already handled, shouldn't reach here
+                            }
+                        }
+                    } else {
+                        // Normal app UI - only when authenticated
 
                     // Status bar background
                     // vertex_builder.rect(0.0, 0.0, width, 32.0, [0.1, 0.1, 0.12, 0.9]);
@@ -996,6 +1035,8 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
                         vertex_builder.upload_status_overlay(&font, width, height, &upload_status);
                     }
 
+                    } // End of authenticated UI block
+
                     // Build GPU buffer
                     let vertex_buffer = vertex_builder.build(&device);
                     vertex_buffer.did_modify_range(metal::NSRange::new(
@@ -1074,9 +1115,5 @@ fn run_app(initial_tokens: auth::AuthTokens) -> i32 {
     });
     
     // Return the exit code
-    if should_logout.load(Ordering::Relaxed) {
-        EXIT_CODE_LOGOUT
-    } else {
-        0
-    }
+    *exit_code_ref.lock().unwrap()
 }

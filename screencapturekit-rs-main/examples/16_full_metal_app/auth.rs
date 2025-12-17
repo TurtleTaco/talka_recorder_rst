@@ -23,14 +23,14 @@ struct DeviceCodeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
+pub struct DeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
     #[serde(default)]
-    verification_uri_complete: String,
-    expires_in: u64,
-    interval: u64,
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    pub interval: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,8 +140,6 @@ pub async fn start_device_flow() -> Result<(String, String, DeviceCodeResponse),
         scope: Some("openid profile email offline_access".to_string()),
     };
 
-    println!("🔐 Requesting device code from Auth0...");
-
     let response = client
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -163,12 +161,6 @@ pub async fn start_device_flow() -> Result<(String, String, DeviceCodeResponse),
         .json()
         .await
         .map_err(|e| AuthError::NetworkError(e.to_string()))?;
-
-    println!("✅ Device code received");
-    println!("   User code: {}", device_response.user_code);
-    println!("   Verification URI: {}", device_response.verification_uri);
-    println!("   Expires in: {} seconds", device_response.expires_in);
-    println!("   Poll interval: {} seconds", device_response.interval);
 
     Ok((
         device_response.verification_uri.clone(),
@@ -253,8 +245,6 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<AuthTokens, Aut
         refresh_token: refresh_token.to_string(),
     };
 
-    println!("🔄 Refreshing access token...");
-
     let response = client
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -287,8 +277,6 @@ pub async fn refresh_access_token(refresh_token: &str) -> Result<AuthTokens, Aut
             } else {
                 new_refresh_token
             };
-
-            println!("✅ Token refreshed successfully!");
             
             Ok(AuthTokens {
                 access_token,
@@ -319,7 +307,6 @@ pub fn save_tokens(tokens: &AuthTokens) -> Result<(), std::io::Error> {
     let path = get_token_file_path();
     let json = serde_json::to_string_pretty(tokens)?;
     fs::write(&path, json)?;
-    println!("💾 Tokens saved to: {}", path.display());
     Ok(())
 }
 
@@ -332,19 +319,10 @@ pub fn load_tokens() -> Option<AuthTokens> {
 
     match fs::read_to_string(&path) {
         Ok(json) => match serde_json::from_str::<AuthTokens>(&json) {
-            Ok(tokens) => {
-                println!("📂 Loaded tokens from: {}", path.display());
-                Some(tokens)
-            }
-            Err(e) => {
-                eprintln!("⚠️  Failed to parse token file: {}", e);
-                None
-            }
+            Ok(tokens) => Some(tokens),
+            Err(_) => None,
         },
-        Err(e) => {
-            eprintln!("⚠️  Failed to read token file: {}", e);
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -353,9 +331,6 @@ pub fn logout() -> Result<(), std::io::Error> {
     let path = get_token_file_path();
     if path.exists() {
         fs::remove_file(&path)?;
-        println!("🚪 Logged out - tokens deleted from: {}", path.display());
-    } else {
-        println!("ℹ️  No tokens to delete");
     }
     Ok(())
 }
@@ -369,51 +344,31 @@ pub fn logout() -> Result<(), std::io::Error> {
 /// 4. Otherwise, starts new device flow
 pub async fn get_valid_tokens() -> Result<AuthTokens, AuthError> {
     // Try to load existing tokens
-    if let Some(mut tokens) = load_tokens() {
+    if let Some(tokens) = load_tokens() {
         if tokens.is_expired() {
-            println!("⚠️  Access token expired");
-            
             if !tokens.refresh_token.is_empty() {
                 // Try to refresh
                 match refresh_access_token(&tokens.refresh_token).await {
                     Ok(new_tokens) => {
                         // Save refreshed tokens
-                        if let Err(e) = save_tokens(&new_tokens) {
-                            eprintln!("⚠️  Failed to save refreshed tokens: {}", e);
-                        }
+                        let _ = save_tokens(&new_tokens);
                         return Ok(new_tokens);
                     }
-                    Err(e) => {
-                        eprintln!("⚠️  Token refresh failed: {}", e);
-                        eprintln!("   Starting new authentication...");
+                    Err(_) => {
                         // Fall through to new device flow
                     }
                 }
-            } else {
-                println!("⚠️  No refresh token available, need to re-authenticate");
             }
         } else {
-            println!("✅ Using cached tokens (valid for {} more seconds)", 
-                tokens.expires_at.saturating_sub(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs()
-                )
-            );
             return Ok(tokens);
         }
-    } else {
-        println!("ℹ️  No cached tokens found");
     }
 
     // No valid tokens - start new device flow
     let tokens = complete_device_flow().await?;
     
     // Save the new tokens
-    if let Err(e) = save_tokens(&tokens) {
-        eprintln!("⚠️  Failed to save tokens: {}", e);
-    }
+    let _ = save_tokens(&tokens);
     
     Ok(tokens)
 }
@@ -426,21 +381,10 @@ pub async fn get_valid_tokens() -> Result<AuthTokens, AuthError> {
 /// 3. Polls for completion
 ///
 /// The caller should display the verification_uri and user_code to the user
+/// Note: This is now deprecated in favor of using start_device_flow and poll_for_token separately
+/// for UI-based authentication flows.
 pub async fn complete_device_flow() -> Result<AuthTokens, AuthError> {
-    let (verification_uri, user_code, device_response) = start_device_flow().await?;
-
-    println!("\n╔═══════════════════════════════════════════════════╗");
-    println!("║           🔐 AUTHENTICATION REQUIRED              ║");
-    println!("╠═══════════════════════════════════════════════════╣");
-    println!("║                                                   ║");
-    println!("║  1. Open this URL in your browser:               ║");
-    println!("║     {}                  ║", verification_uri);
-    println!("║                                                   ║");
-    println!("║  2. Enter this code:                              ║");
-    println!("║     {}                               ║", user_code);
-    println!("║                                                   ║");
-    println!("║  Waiting for you to complete authentication...   ║");
-    println!("╚═══════════════════════════════════════════════════╝\n");
+    let (_verification_uri, _user_code, device_response) = start_device_flow().await?;
 
     let start_time = Instant::now();
     let expires_at = start_time + Duration::from_secs(device_response.expires_in);
@@ -453,35 +397,20 @@ pub async fn complete_device_flow() -> Result<AuthTokens, AuthError> {
 
         tokio::time::sleep(poll_interval).await;
 
-        print!("⏳ Polling for authorization... ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
         match poll_for_token(&device_response.device_code).await {
             Ok(mut tokens) => {
-                println!("✅ Success!\n");
-                println!("╔═══════════════════════════════════════════════════╗");
-                println!("║         🎉 AUTHENTICATION SUCCESSFUL              ║");
-                println!("╚═══════════════════════════════════════════════════╝\n");
                 tokens.update_expiration();
                 return Ok(tokens);
             }
             Err(AuthError::AuthorizationPending) => {
-                println!("⏳ Still waiting...");
+                // Keep waiting
             }
             Err(AuthError::SlowDown) => {
-                println!("⚠️  Slowing down polling...");
                 poll_interval += Duration::from_secs(5);
             }
             Err(e) => {
-                println!("❌ Error: {}", e);
                 return Err(e);
             }
-        }
-
-        let elapsed = Instant::now().duration_since(start_time).as_secs();
-        let remaining = device_response.expires_in.saturating_sub(elapsed);
-        if remaining < 60 {
-            println!("⚠️  Code expires in {} seconds", remaining);
         }
     }
 }
