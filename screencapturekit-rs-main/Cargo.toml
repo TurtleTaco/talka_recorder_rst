@@ -87,6 +87,19 @@ targets = ["x86_64-apple-darwin", "aarch64-apple-darwin"]
 # Enable rustdoc unstable features for better docs
 rustdoc-args = ["--cfg", "docsrs"]
 
+[package.metadata.bundle.bin.16_full_metal_app]
+name = "TalkaCapturePro"
+identifier = "ai.talka.capturepro"
+version = "1.0.0"
+category = "Developer Tool"
+short_description = "Full Metal ScreenCaptureKit Demo Application"
+long_description = """
+A complete macOS application demonstrating the full ScreenCaptureKit API with Metal GPU rendering,
+screen capture, audio visualization, video recording, and interactive UI.
+"""
+copyright = "Copyright (c) 2024 Per Johansson. All rights reserved."
+osx_minimum_system_version = "15.0"
+
 [[example]]
 name = "16_full_metal_app"
 path = "examples/16_full_metal_app/main.rs"
