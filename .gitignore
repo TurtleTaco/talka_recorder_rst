@@ -18,3 +18,6 @@ Cargo.lock
 
 # Debug files
 *.pdb
+
+backend
+talka_agent
