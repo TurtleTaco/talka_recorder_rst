@@ -1,16 +1,13 @@
-//! Full Metal Application
+//! Full Metal Application with Modern Dioxus UI
 //!
-//! A complete macOS application demonstrating the full ScreenCaptureKit API:
+//! A complete macOS application demonstrating the full ScreenCaptureKit API with a modern Dioxus UI:
 //!
-//! - **Metal GPU Rendering** - Hardware-accelerated graphics with runtime shader compilation
+//! - **Modern Web UI** - Clean, responsive interface built with Dioxus
+//! - **Metal GPU Rendering** - Hardware-accelerated graphics (background)
 //! - **Screen Capture** - Real-time display/window capture via ScreenCaptureKit
 //! - **Content Picker** - System UI for selecting capture source (macOS 14.0+)
-//! - **Audio Visualization** - Real-time waveform display with VU meters
-//! - **Screenshot Capture** - Single-frame capture with HDR support (macOS 14.0+/26.0+)
 //! - **Video Recording** - Direct-to-file recording (macOS 15.0+)
 //! - **Microphone Capture** - Audio input with device selection (macOS 15.0+)
-//! - **Bitmap Font Rendering** - Custom 8x8 pixel glyph overlay text
-//! - **Interactive Menu** - Keyboard-navigable settings UI
 //!
 //! ## Running
 //!
@@ -20,32 +17,7 @@
 //!
 //! # With recording support (macOS 15.0+)
 //! cargo run --example 16_full_metal_app --features macos_15_0
-//!
-//! # With HDR screenshots (macOS 26.0+)
-//! cargo run --example 16_full_metal_app --features macos_26_0
 //! ```
-//!
-//! ## Controls
-//!
-//! **Initial Menu** (before picking a source):
-//! - `↑`/`↓` - Navigate menu items
-//! - `Enter` - Pick Source / Quit
-//!
-//! **Main Menu** (after picking - capture auto-starts):
-//! - `↑`/`↓` - Navigate menu items
-//! - `Enter` - Select (Stop/Start, Screenshot, Record, Config, Change Source, Quit)
-//! - `Esc`/`H` - Hide menu
-//!
-//! **Direct Controls** (when menu hidden):
-//! - `P` - Open content picker
-//! - `Space` - Start/stop capture
-//! - `S` - Take screenshot
-//! - `R` - Start/stop recording (macOS 15.0+)
-//! - `W` - Toggle waveform display
-//! - `M` - Toggle microphone
-//! - `C` - Open config menu
-//! - `H` - Show menu
-//! - `Q`/`Esc` - Quit
 
 #![allow(
     clippy::too_many_lines,
@@ -60,6 +32,7 @@ mod capture;
 mod font;
 mod input;
 mod overlay;
+mod preview_window;
 #[cfg(feature = "macos_15_0")]
 mod recording;
 mod renderer;
@@ -69,1051 +42,830 @@ mod ui;
 mod upload;
 mod vertex;
 mod waveform;
+mod dioxus_ui;
 
-use std::mem::size_of;
+use dioxus::prelude::*;
+use dioxus::desktop::{Config, WindowBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
 use tokio::runtime::Runtime;
 
-use cocoa::appkit::NSView;
-use cocoa::base::id as cocoa_id;
-use core_graphics_types::geometry::CGSize;
-use metal::{
-    objc, CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLResourceOptions, MTLStoreAction, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
-};
-use objc::rc::autoreleasepool;
-use objc::runtime::YES;
-use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
-use screencapturekit::content_sharing_picker::SCPickedSource;
 use screencapturekit::prelude::*;
-use winit::event::{ElementState, Event, VirtualKeyCode, WindowEvent};
-use winit::event_loop::ControlFlow;
 
 use capture::CaptureState;
-use font::BitmapFont;
-use input::{
-    format_picked_source, open_picker, open_picker_for_stream, start_capture, stop_capture,
-    PickerResult,
-};
-use overlay::{default_stream_config, ConfigMenu, OverlayState};
+use input::{format_picked_source, PickerResult};
+use overlay::default_stream_config;
+use dioxus_ui::CaptureCommand;
+
 #[cfg(feature = "macos_15_0")]
 use recording::{RecordingConfig, RecordingState};
-use renderer::{
-    create_pipeline, create_textures_from_iosurface, CaptureTextures, PIXEL_FORMAT_420F,
-    PIXEL_FORMAT_420V, SHADER_SOURCE,
-};
-use screenshot::take_screenshot;
-use vertex::{Uniforms, Vertex, VertexBufferBuilder};
 
-// Authentication state for UI-based auth flow
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum AuthState {
-    CheckingCache,
-    NeedsAuth { verification_uri: String, user_code: String, device_code: String, poll_interval: u64 },
+    Checking,
+    NeedsAuth { verification_uri: String, user_code: String },
     Authenticating,
-    Authenticated(auth::AuthTokens),
+    Authenticated { profile: auth::UserProfile },
     Error(String),
 }
 
-const EXIT_CODE_LOGOUT: i32 = 42; // Special exit code for logout
-
 fn main() {
-    // Main loop - restart on logout
-    loop {
-        // Run the application (auth happens inside the UI now)
-        let exit_code = run_app();
+    run_app();
+}
+
+fn run_app() {
+    // Create runtime for async operations
+    let runtime = Runtime::new().unwrap();
+    let runtime_handle = runtime.handle().clone();
+
+    // Create communication channel between UI and capture backend
+    let (cmd_tx, cmd_rx): (Sender<CaptureCommand>, Receiver<CaptureCommand>) = channel();
+    
+    // Shared state
+    let is_capturing = Arc::new(AtomicBool::new(false));
+    let is_recording = Arc::new(AtomicBool::new(false));
+    let source_name = Arc::new(Mutex::new(String::from("No source selected")));
+    let auth_state_shared: Arc<Mutex<AuthState>> = Arc::new(Mutex::new(AuthState::Checking));
+    let upload_status_str = Arc::new(Mutex::new(String::from("")));
+    
+    // Shared auth tokens for upload
+    let auth_tokens_shared: Arc<Mutex<Option<auth::AuthTokens>>> = Arc::new(Mutex::new(None));
+
+    // Start authentication in background
+    let auth_state_clone = Arc::clone(&auth_state_shared);
+    let auth_tokens_clone = Arc::clone(&auth_tokens_shared);
+    runtime_handle.spawn(async move {
+        match authenticate_user_with_ui(&auth_state_clone).await {
+            Ok((tokens, profile)) => {
+                *auth_state_clone.lock().unwrap() = AuthState::Authenticated { profile };
+                *auth_tokens_clone.lock().unwrap() = Some(tokens);
+                println!("✅ Authenticated successfully");
+            }
+            Err(e) => {
+                *auth_state_clone.lock().unwrap() = AuthState::Error(e.clone());
+                eprintln!("❌ Authentication failed: {}", e);
+            }
+        }
+    });
+
+    // Create capture state
+    let capture_state = Arc::new(CaptureState::new());
+    
+    // Start capture backend thread
+    let is_capturing_clone = Arc::clone(&is_capturing);
+    let is_recording_clone = Arc::clone(&is_recording);
+    let source_name_clone = Arc::clone(&source_name);
+    let upload_status_clone = Arc::clone(&upload_status_str);
+    let capture_state_backend = Arc::clone(&capture_state);
+    let auth_tokens_backend = Arc::clone(&auth_tokens_shared);
+    
+    thread::spawn(move || {
+        run_capture_backend(
+            cmd_rx,
+            is_capturing_clone,
+            is_recording_clone,
+            source_name_clone,
+            upload_status_clone,
+            runtime_handle,
+            capture_state_backend,
+            auth_tokens_backend,
+        );
+    });
+
+    // Store state in static globals for the Dioxus app
+    unsafe {
+        GLOBAL_CMD_TX = Some(cmd_tx);
+        GLOBAL_IS_CAPTURING = Some(is_capturing);
+        GLOBAL_IS_RECORDING = Some(is_recording);
+        GLOBAL_SOURCE_NAME = Some(source_name);
+        GLOBAL_AUTH_STATE = Some(auth_state_shared);
+        GLOBAL_UPLOAD_STATUS = Some(upload_status_str);
+        GLOBAL_CAPTURE_STATE = Some(capture_state);
+    }
+
+    // Launch Dioxus UI with custom window config
+    let config = Config::new()
+        .with_window(WindowBuilder::new()
+            .with_title("Talka Recorder")
+            .with_resizable(true)
+            .with_inner_size(dioxus::desktop::wry::dpi::LogicalSize::new(1200.0, 800.0)));
+    
+    dioxus::LaunchBuilder::desktop()
+        .with_cfg(config)
+        .launch(app_with_backend);
+}
+
+// Global state for Dioxus app
+static mut GLOBAL_CMD_TX: Option<Sender<CaptureCommand>> = None;
+static mut GLOBAL_IS_CAPTURING: Option<Arc<AtomicBool>> = None;
+static mut GLOBAL_IS_RECORDING: Option<Arc<AtomicBool>> = None;
+static mut GLOBAL_SOURCE_NAME: Option<Arc<Mutex<String>>> = None;
+static mut GLOBAL_AUTH_STATE: Option<Arc<Mutex<AuthState>>> = None;
+static mut GLOBAL_UPLOAD_STATUS: Option<Arc<Mutex<String>>> = None;
+static mut GLOBAL_CAPTURE_STATE: Option<Arc<CaptureState>> = None;
+
+fn get_global_state() -> (
+    Option<Sender<CaptureCommand>>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<Mutex<String>>,
+    Arc<Mutex<AuthState>>,
+    Arc<Mutex<String>>,
+    Arc<CaptureState>,
+) {
+    unsafe {
+        (
+            GLOBAL_CMD_TX.clone(),
+            GLOBAL_IS_CAPTURING.clone().unwrap(),
+            GLOBAL_IS_RECORDING.clone().unwrap(),
+            GLOBAL_SOURCE_NAME.clone().unwrap(),
+            GLOBAL_AUTH_STATE.clone().unwrap(),
+            GLOBAL_UPLOAD_STATUS.clone().unwrap(),
+            GLOBAL_CAPTURE_STATE.clone().unwrap(),
+        )
+    }
+}
+
+fn app_with_backend() -> Element {
+    let (_cmd_tx, is_capturing, is_recording, source_name, auth_state, upload_status, capture_state) = get_global_state();
+
+    let mut is_capturing_sig = use_signal(|| is_capturing.load(Ordering::Relaxed));
+    let mut is_recording_sig = use_signal(|| is_recording.load(Ordering::Relaxed));
+    let mut source_name_sig = use_signal(|| source_name.lock().unwrap().clone());
+    let mut auth_state_sig = use_signal(|| auth_state.lock().unwrap().clone());
+    let mut upload_status_sig = use_signal(|| upload_status.lock().unwrap().clone());
+    let mut frame_count_sig = use_signal(|| 0u64);
+    let mut capture_info_sig = use_signal(|| String::from(""));
+
+    // Poll for updates every 100ms
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            let (_, is_cap, is_rec, src_name, auth, upl, cap_state) = get_global_state();
+            is_capturing_sig.set(is_cap.load(Ordering::Relaxed));
+            is_recording_sig.set(is_rec.load(Ordering::Relaxed));
+            source_name_sig.set(src_name.lock().unwrap().clone());
+            auth_state_sig.set(auth.lock().unwrap().clone());
+            upload_status_sig.set(upl.lock().unwrap().clone());
+            
+            // Update frame count and capture info
+            let frame_count = cap_state.frame_count.load(Ordering::Relaxed);
+            frame_count_sig.set(frame_count as u64);
+            
+            if is_cap.load(Ordering::Relaxed) {
+                // Get surface dimensions
+                let surface_info = if let Ok(guard) = cap_state.latest_surface.try_lock() {
+                    if let Some(ref surface) = *guard {
+                        format!("{}x{}", surface.width(), surface.height())
+                    } else {
+                        "Waiting...".to_string()
+                    }
+                } else {
+                    "Processing...".to_string()
+                };
+                capture_info_sig.set(format!("{} frames | {}", frame_count, surface_info));
+            } else {
+                capture_info_sig.set(String::new());
+            }
+        }
+    });
+
+    rsx! {
+        style { {include_str!("./assets/main.css")} }
         
-        // Check if we should restart (logout) or exit
-        if exit_code == EXIT_CODE_LOGOUT {
-            continue; // Restart the loop
+        // Show login overlay if not authenticated
+        if !matches!(*auth_state_sig.read(), AuthState::Authenticated { .. }) {
+            LoginOverlay { auth_state: auth_state_sig.read().clone() }
         } else {
-            // Normal exit
-            break;
+            div { id: "app",
+                // Header with logo and profile
+                Header { 
+                    auth_state: auth_state_sig.read().clone(),
+                    source_name: source_name_sig.read().clone(),
+                }
+                
+                // Main content area
+                div { id: "capture-view",
+                    CapturePreview { 
+                        is_capturing: *is_capturing_sig.read(),
+                        is_recording: *is_recording_sig.read(),
+                        capture_info: capture_info_sig.read().clone(),
+                    }
+                }
+                
+                // Control panel
+                ControlPanel {
+                    is_capturing: *is_capturing_sig.read(),
+                    is_recording: *is_recording_sig.read(),
+                    source_name: source_name_sig.read().clone(),
+                }
+                
+                // Status bar
+                StatusBar {
+                    upload_status: upload_status_sig.read().clone(),
+                }
+            }
         }
     }
 }
 
-fn run_app() -> i32 {
-    // Create tokio runtime for async operations (auth, upload)
-    let runtime = Runtime::new().unwrap();
-    let runtime_handle = runtime.handle().clone();
+// Login overlay component
+#[component]
+fn LoginOverlay(auth_state: AuthState) -> Element {
+    const LOGO_SVG: &str = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzkxIiBoZWlnaHQ9IjE2OCIgdmlld0JveD0iMCAwIDM5MSAxNjgiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHg9IjI0IiB5PSI1MiIgd2lkdGg9IjI0IiBoZWlnaHQ9IjY0IiByeD0iMTIiIGZpbGw9IiM2NDhGRkYiLz4KPHJlY3QgeD0iNTYiIHk9IjM0IiB3aWR0aD0iMjQiIGhlaWdodD0iMTAwIiByeD0iMTIiIGZpbGw9IiMyNkM0ODUiLz4KPHJlY3QgeD0iODgiIHk9IjUyIiB3aWR0aD0iMjQiIGhlaWdodD0iNjQiIHJ4PSIxMiIgZmlsbD0iI0UwMUU1QSIvPgo8cmVjdCB4PSIxMjAiIHk9IjY4IiB3aWR0aD0iMjQiIGhlaWdodD0iMzIiIHJ4PSIxMiIgZmlsbD0iI0Y2QUUyRCIvPgo8cGF0aCBkPSJNMjA3LjA0IDc0LjE2VjEwMEMyMDcuMDQgMTAyLjEzMyAyMDcuNDkzIDEwMy42NTMgMjA4LjQgMTA0LjU2QzIwOS4zMDcgMTA1LjQxMyAyMTAuODggMTA1Ljg0IDIxMy4xMiAxMDUuODRIMjE4LjQ4VjExMkgyMTEuOTJDMjA3Ljg2NyAxMTIgMjA0LjgyNyAxMTEuMDY3IDIwMi44IDEwOS4yQzIwMC43NzMgMTA3LjMzMyAxOTkuNzYgMTA0LjI2NyAxOTkuNzYgMTAwVjc0LjE2SDE5NC4wOFY2OC4xNkgxOTkuNzZWNTcuMTJIMjA3LjA0VjY4LjE2SDIxOC40OFY3NC4xNkgyMDcuMDRaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMjI0LjU4MSA4OS45MkMyMjQuNTgxIDg1LjQ0IDIyNS40ODcgODEuNTIgMjI3LjMwMSA3OC4xNkMyMjkuMTE0IDc0Ljc0NjcgMjMxLjU5NCA3Mi4xMDY3IDIzNC43NDEgNzAuMjRDMjM3Ljk0MSA2OC4zNzMzIDI0MS40ODcgNjcuNDQgMjQ1LjM4MSA2Ny40NEMyNDkuMjIxIDY3LjQ0IDI1Mi41NTQgNjguMjY2NyAyNTUuMzgxIDY5LjkyQzI1OC4yMDcgNzEuNTczMyAyNjAuMzE0IDczLjY1MzMgMjYxLjcwMSA3Ni4xNlY2OC4xNkgyNjkuMDYxVjExMkgyNjEuNzAxVjEwMy44NEMyNjAuMjYxIDEwNi40IDI1OC4xMDEgMTA4LjUzMyAyNTUuMjIxIDExMC4yNEMyNTIuMzk0IDExMS44OTMgMjQ5LjA4NyAxMTIuNzIgMjQ1LjMwMSAxMTIuNzJDMjQxLjQwNyAxMTIuNzIgMjM3Ljg4NyAxMTEuNzYgMjM0Ljc0MSAxMDkuODRDMjMxLjU5NCAxMDcuOTIgMjI5LjExNCAxMDUuMjI3IDIyNy4zMDEgMTAxLjc2QzIyNS40ODcgOTguMjkzMyAyMjQuNTgxIDk0LjM0NjcgMjI0LjU4MSA4OS45MlpNMjYxLjcwMSA5MEMyNjEuNzAxIDg2LjY5MzMgMjYxLjAzNCA4My44MTMzIDI1OS43MDEgODEuMzZDMjU4LjM2NyA3OC45MDY3IDI1Ni41NTQgNzcuMDQgMjU0LjI2MSA3NS43NkMyNTIuMDIxIDc0LjQyNjcgMjQ5LjU0MSA3My43NiAyNDYuODIxIDczLjc2QzI0NC4xMDEgNzMuNzYgMjQxLjYyMSA3NC40IDIzOS4zODEgNzUuNjhDMjM3LjE0MSA3Ni45NiAyMzUuMzU0IDc4LjgyNjcgMjM0LjAyMSA4MS4yOEMyMzIuNjg3IDgzLjczMzMgMjMyLjAyMSA4Ni42MTMzIDIzMi4wMjEgODkuOTJDMjMyLjAyMSA5My4yOCAyMzIuNjg3IDk2LjIxMzMgMjM0LjAyMSA5OC43MkMyMzUuMzU0IDEwMS4xNzMgMjM3LjE0MSAxMDMuMDY3IDIzOS4zODEgMTA0LjRDMjQxLjYyMSAxMDUuNjggMjQ0LjEwMSAxMDYuMzIgMjQ2LjgyMSAxMDYuMzJDMjQ5LjU0MSAxMDYuMzIgMjUyLjAyMSAxMDUuNjggMjU0LjI2MSAxMDQuNEMyNTYuNTU0IDEwMy4wNjcgMjU4LjM2NyAxMDEuMTczIDI1OS43MDEgOTguNzJDMjYxLjAzNCA5Ni4yMTMzIDI2MS43MDEgOTMuMzA2NyAyNjEuNzAxIDkwWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTI4OC42NDMgNTIuOFYxMTJIMjgxLjM2M1Y1Mi44SDI4OC42NDNaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMzI1LjUzMSAxMTJMMzA4LjMzMSA5Mi42NFYxMTJIMzAxLjA1MVY1Mi44SDMwOC4zMzFWODcuNkwzMjUuMjExIDY4LjE2SDMzNS4zNzFMMzE0LjczMSA5MEwzMzUuNDUxIDExMkgzMjUuNTMxWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTMzOS41MDMgODkuOTJDMzM5LjUwMyA4NS40NCAzNDAuNDA5IDgxLjUyIDM0Mi4yMjMgNzguMTZDMzQ0LjAzNiA3NC43NDY3IDM0Ni41MTYgNzIuMTA2NyAzNDkuNjYzIDcwLjI0QzM1Mi44NjMgNjguMzczMyAzNTYuNDA5IDY3LjQ0IDM2MC4zMDMgNjcuNDRDMzY0LjE0MyA2Ny40NCAzNjcuNDc2IDY4LjI2NjcgMzcwLjMwMyA2OS45MkMzNzMuMTI5IDcxLjU3MzMgMzc1LjIzNiA3My42NTMzIDM3Ni42MjMgNzYuMTZWNjguMTZIMzgzLjk4M1YxMTJIMzc2LjYyM1YxMDMuODRDMzc1LjE4MyAxMDYuNCAzNzMuMDIzIDEwOC41MzMgMzcwLjE0MyAxMTAuMjRDMzY3LjMxNiAxMTEuODkzIDM2NC4wMDkgMTEyLjcyIDM2MC4yMjMgMTEyLjcyQzM1Ni4zMjkgMTEyLjcyIDM1Mi44MDkgMTExLjc2IDM0OS42NjMgMTA5Ljg0QzM0Ni41MTYgMTA3LjkyIDM0NC4wMzYgMTA1LjIyNyAzNDIuMjIzIDEwMS43NkMzNDAuNDA5IDk4LjI5MzMgMzM5LjUwMyA5NC4zNDY3IDMzOS41MDMgODkuOTJaTTM3Ni42MjMgOTBDMzc2LjYyMyA4Ni42OTMzIDM3NS45NTYgODMuODEzMyAzNzQuNjIzIDgxLjM2QzM3My4yODkgNzguOTA2NyAzNzEuNDc2IDc3LjA0IDM2OS4xODMgNzUuNzZDMzY2Ljk0MyA3NC40MjY3IDM2NC40NjMgNzMuNzYgMzYxLjc0MyA3My43NkMzNTkuMDIzIDczLjc2IDM1Ni41NDMgNzQuNCAzNTQuMzAzIDc1LjY4QzM1Mi4wNjMgNzYuOTYgMzUwLjI3NiA3OC44MjY3IDM0OC45NDMgODEuMjhDMzQ3LjYwOSA4My43MzMzIDM0Ni45NDMgODYuNjEzMyAzNDYuOTQzIDg5LjkyQzM0Ni45NDMgOTMuMjggMzQ3LjYwOSA5Ni4yMTMzIDM0OC45NDMgOTguNzJDMzUwLjI3NiAxMDEuMTczIDM1Mi4wNjMgMTAzLjA2NyAzNTQuMzAzIDEwNC40QzM1Ni41NDMgMTA1LjY4IDM1OS4wMjMgMTA2LjMyIDM2MS43NDMgMTA2LjMyQzM2NC40NjMgMTA2LjMyIDM2Ni45NDMgMTA1LjY4IDM2OS4xODMgMTA0LjRDMzcxLjQ3NiAxMDMuMDY3IDM3My4yODkgMTAxLjE3MyAzNzQuNjIzIDk4LjcyQzM3NS45NTYgOTYuMjEzMyAzNzYuNjIzIDkzLjMwNjcgMzc2LjYyMyA5MFoiIGZpbGw9ImJsYWNrIi8+Cjwvc3ZnPgo=";
     
-    // Start with checking cache state
-    let auth_state = Arc::new(Mutex::new(AuthState::CheckingCache));
-    let auth_tokens: Arc<Mutex<Option<auth::AuthTokens>>> = Arc::new(Mutex::new(None));
-
-    // Create window
-    let event_loop = winit::event_loop::EventLoop::new();
-    let window = winit::window::WindowBuilder::new()
-        .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
-        .with_title("ScreenCaptureKit Metal Overlay")
-        .build(&event_loop)
-        .unwrap();
-
-    // Initialize Metal
-    let device = Device::system_default().expect("No Metal device found");
-    println!("🖥️  Metal device: {}", device.name());
-
-    let mut layer = MetalLayer::new();
-    layer.set_device(&device);
-    layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-    layer.set_presents_with_transaction(false);
-
-    // Attach layer to window
-    unsafe {
-        match window.raw_window_handle() {
-            RawWindowHandle::AppKit(handle) => {
-                let view = handle.ns_view as cocoa_id;
-                view.setWantsLayer(YES);
-                view.setLayer(std::mem::transmute(layer.as_mut()));
+    rsx! {
+        div { class: "login-overlay",
+            div { class: "login-container",
+                img { 
+                    class: "login-logo",
+                    src: "{LOGO_SVG}",
+                }
+                
+                match auth_state {
+                    AuthState::Checking => rsx! {
+                        h2 { class: "login-title", "Welcome to Talka Recorder" }
+                        p { class: "login-subtitle", "Checking authentication..." }
+                        div { class: "waiting-message",
+                            div { class: "spinner" }
+                            span { "Loading..." }
+                        }
+                    },
+                    AuthState::NeedsAuth { ref verification_uri, ref user_code } => {
+                        let uri_clone = verification_uri.clone();
+                        let code_clone = user_code.clone();
+                        rsx! {
+                            h2 { class: "login-title", "Sign in to Continue" }
+                            p { class: "login-subtitle", "Complete authentication in your browser" }
+                            
+                            div { class: "login-step",
+                                p { class: "step-label", "Step 1: Open this URL in your browser" }
+                                div { class: "code-box",
+                                    span { class: "url-text", "{verification_uri}" }
+                                    button { 
+                                        class: "copy-btn",
+                                        onclick: move |_| {
+                                            // Copy to clipboard
+                                            let _ = copy_to_clipboard(&uri_clone);
+                                        },
+                                        "Copy"
+                                    }
+                                }
+                            }
+                            
+                            div { class: "login-step",
+                                p { class: "step-label", "Step 2: Enter this code" }
+                                div { class: "code-box",
+                                    span { class: "code-text", "{user_code}" }
+                                    button { 
+                                        class: "copy-btn",
+                                        onclick: move |_| {
+                                            // Copy to clipboard
+                                            let _ = copy_to_clipboard(&code_clone);
+                                        },
+                                        "Copy"
+                                    }
+                                }
+                            }
+                            
+                            div { class: "waiting-message",
+                                div { class: "spinner" }
+                                span { "Waiting for you to complete authentication..." }
+                            }
+                        }
+                    },
+                    AuthState::Authenticating => rsx! {
+                        h2 { class: "login-title", "Completing Authentication" }
+                        p { class: "login-subtitle", "Please wait..." }
+                        div { class: "waiting-message",
+                            div { class: "spinner" }
+                            span { "Finalizing..." }
+                        }
+                    },
+                    AuthState::Error(ref err) => rsx! {
+                        h2 { class: "login-title", "Authentication Error" }
+                        p { class: "login-subtitle", "{err}" }
+                        p { style: "color: #D93025; margin-top: 1rem;", "Please restart the application to try again." }
+                    },
+                    _ => rsx! { div {} }
+                }
             }
-            _ => panic!("Unsupported window handle"),
         }
     }
+}
 
-    let draw_size = window.inner_size();
-    layer.set_drawable_size(CGSize::new(
-        f64::from(draw_size.width),
-        f64::from(draw_size.height),
-    ));
-
-    // Compile shaders at runtime from embedded source
-    println!("🔧 Compiling shaders...");
-    let compile_options = CompileOptions::new();
-    let library = device
-        .new_library_with_source(SHADER_SOURCE, &compile_options)
-        .expect("Failed to compile shaders");
-    println!("✅ Shaders compiled");
-
-    let overlay_pipeline = create_pipeline(&device, &library, "vertex_colored", "fragment_colored");
-
-    // Create fullscreen textured pipeline (no blending for background) - for BGRA/RGB formats
-    let fullscreen_pipeline = {
-        let vert = library.get_function("vertex_fullscreen", None).unwrap();
-        let frag = library.get_function("fragment_textured", None).unwrap();
-        let desc = RenderPipelineDescriptor::new();
-        desc.set_vertex_function(Some(&vert));
-        desc.set_fragment_function(Some(&frag));
-        desc.color_attachments()
-            .object_at(0)
-            .unwrap()
-            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        device.new_render_pipeline_state(&desc).unwrap()
+#[component]
+fn Header(auth_state: AuthState, source_name: String) -> Element {
+    const LOGO_SVG: &str = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzkxIiBoZWlnaHQ9IjE2OCIgdmlld0JveD0iMCAwIDM5MSAxNjgiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHg9IjI0IiB5PSI1MiIgd2lkdGg9IjI0IiBoZWlnaHQ9IjY0IiByeD0iMTIiIGZpbGw9IiM2NDhGRkYiLz4KPHJlY3QgeD0iNTYiIHk9IjM0IiB3aWR0aD0iMjQiIGhlaWdodD0iMTAwIiByeD0iMTIiIGZpbGw9IiMyNkM0ODUiLz4KPHJlY3QgeD0iODgiIHk9IjUyIiB3aWR0aD0iMjQiIGhlaWdodD0iNjQiIHJ4PSIxMiIgZmlsbD0iI0UwMUU1QSIvPgo8cmVjdCB4PSIxMjAiIHk9IjY4IiB3aWR0aD0iMjQiIGhlaWdodD0iMzIiIHJ4PSIxMiIgZmlsbD0iI0Y2QUUyRCIvPgo8cGF0aCBkPSJNMjA3LjA0IDc0LjE2VjEwMEMyMDcuMDQgMTAyLjEzMyAyMDcuNDkzIDEwMy42NTMgMjA4LjQgMTA0LjU2QzIwOS4zMDcgMTA1LjQxMyAyMTAuODggMTA1Ljg0IDIxMy4xMiAxMDUuODRIMjE4LjQ4VjExMkgyMTEuOTJDMjA3Ljg2NyAxMTIgMjA0LjgyNyAxMTEuMDY3IDIwMi44IDEwOS4yQzIwMC43NzMgMTA3LjMzMyAxOTkuNzYgMTA0LjI2NyAxOTkuNzYgMTAwVjc0LjE2SDE5NC4wOFY2OC4xNkgxOTkuNzZWNTcuMTJIMjA3LjA0VjY4LjE2SDIxOC40OFY3NC4xNkgyMDcuMDRaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMjI0LjU4MSA4OS45MkMyMjQuNTgxIDg1LjQ0IDIyNS40ODcgODEuNTIgMjI3LjMwMSA3OC4xNkMyMjkuMTE0IDc0Ljc0NjcgMjMxLjU5NCA3Mi4xMDY3IDIzNC43NDEgNzAuMjRDMjM3Ljk0MSA2OC4zNzMzIDI0MS40ODcgNjcuNDQgMjQ1LjM4MSA2Ny40NEMyNDkuMjIxIDY3LjQ0IDI1Mi41NTQgNjguMjY2NyAyNTUuMzgxIDY5LjkyQzI1OC4yMDcgNzEuNTczMyAyNjAuMzE0IDczLjY1MzMgMjYxLjcwMSA3Ni4xNlY2OC4xNkgyNjkuMDYxVjExMkgyNjEuNzAxVjEwMy44NEMyNjAuMjYxIDEwNi40IDI1OC4xMDEgMTA4LjUzMyAyNTUuMjIxIDExMC4yNEMyNTIuMzk0IDExMS44OTMgMjQ5LjA4NyAxMTIuNzIgMjQ1LjMwMSAxMTIuNzJDMjQxLjQwNyAxMTIuNzIgMjM3Ljg4NyAxMTEuNzYgMjM0Ljc0MSAxMDkuODRDMjMxLjU5NCAxMDcuOTIgMjI5LjExNCAxMDUuMjI3IDIyNy4zMDEgMTAxLjc2QzIyNS40ODcgOTguMjkzMyAyMjQuNTgxIDk0LjM0NjcgMjI0LjU4MSA4OS45MlpNMjYxLjcwMSA5MEMyNjEuNzAxIDg2LjY5MzMgMjYxLjAzNCA4My44MTMzIDI1OS43MDEgODEuMzZDMjU4LjM2NyA3OC45MDY3IDI1Ni41NTQgNzcuMDQgMjU0LjI2MSA3NS43NkMyNTIuMDIxIDc0LjQyNjcgMjQ5LjU0MSA3My43NiAyNDYuODIxIDczLjc2QzI0NC4xMDEgNzMuNzYgMjQxLjYyMSA3NC40IDIzOS4zODEgNzUuNjhDMjM3LjE0MSA3Ni45NiAyMzUuMzU0IDc4LjgyNjcgMjM0LjAyMSA4MS4yOEMyMzIuNjg3IDgzLjczMzMgMjMyLjAyMSA4Ni42MTMzIDIzMi4wMjEgODkuOTJDMjMyLjAyMSA5My4yOCAyMzIuNjg3IDk2LjIxMzMgMjM0LjAyMSA5OC43MkMyMzUuMzU0IDEwMS4xNzMgMjM3LjE0MSAxMDMuMDY3IDIzOS4zODEgMTA0LjRDMjQxLjYyMSAxMDUuNjggMjQ0LjEwMSAxMDYuMzIgMjQ2LjgyMSAxMDYuMzJDMjQ5LjU0MSAxMDYuMzIgMjUyLjAyMSAxMDUuNjggMjU0LjI2MSAxMDQuNEMyNTYuNTU0IDEwMy4wNjcgMjU4LjM2NyAxMDEuMTczIDI1OS43MDEgOTguNzJDMjYxLjAzNCA5Ni4yMTMzIDI2MS43MDEgOTMuMzA2NyAyNjEuNzAxIDkwWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTI4OC42NDMgNTIuOFYxMTJIMjgxLjM2M1Y1Mi44SDI4OC42NDNaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMzI1LjUzMSAxMTJMMzA4LjMzMSA5Mi42NFYxMTJIMzAxLjA1MVY1Mi44SDMwOC4zMzFWODcuNkwzMjUuMjExIDY4LjE2SDMzNS4zNzFMMzE0LjczMSA5MEwzMzUuNDUxIDExMkgzMjUuNTMxWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTMzOS41MDMgODkuOTJDMzM5LjUwMyA4NS40NCAzNDAuNDA5IDgxLjUyIDM0Mi4yMjMgNzguMTZDMzQ0LjAzNiA3NC43NDY3IDM0Ni41MTYgNzIuMTA2NyAzNDkuNjYzIDcwLjI0QzM1Mi44NjMgNjguMzczMyAzNTYuNDA5IDY3LjQ0IDM2MC4zMDMgNjcuNDRDMzY0LjE0MyA2Ny40NCAzNjcuNDc2IDY4LjI2NjcgMzcwLjMwMyA2OS45MkMzNzMuMTI5IDcxLjU3MzMgMzc1LjIzNiA3My42NTMzIDM3Ni42MjMgNzYuMTZWNjguMTZIMzgzLjk4M1YxMTJIMzc2LjYyM1YxMDMuODRDMzc1LjE4MyAxMDYuNCAzNzMuMDIzIDEwOC41MzMgMzcwLjE0MyAxMTAuMjRDMzY3LjMxNiAxMTEuODkzIDM2NC4wMDkgMTEyLjcyIDM2MC4yMjMgMTEyLjcyQzM1Ni4zMjkgMTEyLjcyIDM1Mi44MDkgMTExLjc2IDM0OS42NjMgMTA5Ljg0QzM0Ni41MTYgMTA3LjkyIDM0NC4wMzYgMTA1LjIyNyAzNDIuMjIzIDEwMS43NkMzNDAuNDA5IDk4LjI5MzMgMzM5LjUwMyA5NC4zNDY3IDMzOS41MDMgODkuOTJaTTM3Ni42MjMgOTBDMzc2LjYyMyA4Ni42OTMzIDM3NS45NTYgODMuODEzMyAzNzQuNjIzIDgxLjM2QzM3My4yODkgNzguOTA2NyAzNzEuNDc2IDc3LjA0IDM2OS4xODMgNzUuNzZDMzY2Ljk0MyA3NC40MjY3IDM2NC40NjMgNzMuNzYgMzYxLjc0MyA3My43NkMzNTkuMDIzIDczLjc2IDM1Ni41NDMgNzQuNCAzNTQuMzAzIDc1LjY4QzM1Mi4wNjMgNzYuOTYgMzUwLjI3NiA3OC44MjY3IDM0OC45NDMgODEuMjhDMzQ3LjYwOSA4My43MzMzIDM0Ni45NDMgODYuNjEzMyAzNDYuOTQzIDg5LjkyQzM0Ni45NDMgOTMuMjggMzQ3LjYwOSA5Ni4yMTMzIDM0OC45NDMgOTguNzJDMzUwLjI3NiAxMDEuMTczIDM1Mi4wNjMgMTAzLjA2NyAzNTQuMzAzIDEwNC40QzM1Ni41NDMgMTA1LjY4IDM1OS4wMjMgMTA2LjMyIDM2MS43NDMgMTA2LjMyQzM2NC40NjMgMTA2LjMyIDM2Ni45NDMgMTA1LjY4IDM2OS4xODMgMTA0LjRDMzcxLjQ3NiAxMDMuMDY3IDM3My4yODkgMTAxLjE3MyAzNzQuNjIzIDk4LjcyQzM3NS45NTYgOTYuMjEzMyAzNzYuNjIzIDkzLjMwNjcgMzc2LjYyMyA5MFoiIGZpbGw9ImJsYWNrIi8+Cjwvc3ZnPgo=";
+    
+    let profile = match auth_state {
+        AuthState::Authenticated { ref profile } => Some(profile.clone()),
+        _ => None,
     };
+    
+    rsx! {
+        header { id: "app-header",
+            div { class: "logo-section",
+                img { 
+                    src: "{LOGO_SVG}",
+                    style: "height: 40px;",
+                }
+            }
+            
+            div { class: "header-actions",
+                if !source_name.is_empty() && source_name != "No source selected" {
+                    div { class: "source-info",
+                        span { class: "label", "Source:" }
+                        span { class: "source-name", "{source_name}" }
+                    }
+                }
+                
+                if let Some(ref p) = profile {
+                    div { class: "user-profile",
+                        div { class: "user-avatar", "{p.initials()}" }
+                        div { class: "user-info",
+                            div { class: "user-name", "{p.display_name()}" }
+                            if !p.email.is_empty() {
+                                div { class: "user-email", "{p.email}" }
+                            }
+                        }
+                    }
+                }
+                
+                button {
+                    class: "btn btn-text",
+                    onclick: move |_| {
+                        // Clear tokens immediately
+                        let _ = auth::logout();
+                        println!("🔓 Logged out successfully");
+                        // Exit the app
+                        std::process::exit(0);
+                    },
+                    "Logout"
+                }
+            }
+        }
+    }
+}
 
-    // Create YCbCr pipeline for biplanar YCbCr formats (420v/420f)
-    let ycbcr_pipeline = {
-        let vert = library.get_function("vertex_fullscreen", None).unwrap();
-        let frag = library.get_function("fragment_ycbcr", None).unwrap();
-        let desc = RenderPipelineDescriptor::new();
-        desc.set_vertex_function(Some(&vert));
-        desc.set_fragment_function(Some(&frag));
-        desc.color_attachments()
-            .object_at(0)
-            .unwrap()
-            .set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        device.new_render_pipeline_state(&desc).unwrap()
+#[component]
+fn CapturePreview(is_capturing: bool, is_recording: bool, capture_info: String) -> Element {
+    rsx! {
+        div { class: "capture-preview",
+            if is_recording {
+                div { class: "live-indicator",
+                    span { class: "pulse-dot" }
+                    span { "RECORDING" }
+                }
+            }
+            div { class: "preview-placeholder",
+                if is_capturing && is_recording {
+                    p { "⏺️ Recording in Progress" }
+                    p { class: "capture-stats", "{capture_info}" }
+                    p { class: "hint", "Your screen is being recorded" }
+                    p { class: "hint-small", "Click \"Stop Recording\" when done" }
+                } else if is_capturing {
+                    p { "✅ Ready to Record" }
+                    p { class: "capture-stats", "{capture_info}" }
+                    p { class: "hint", "Source is active - click \"Start Recording\" below" }
+                } else {
+                    p { "👋 Welcome to Talka Recorder" }
+                    p { class: "hint", "1. Select a capture source below" }
+                    p { class: "hint", "2. Start recording when ready" }
+                    p { class: "hint", "3. Your recording will auto-upload when complete" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ControlPanel(is_capturing: bool, is_recording: bool, source_name: String) -> Element {
+    let has_source = !source_name.is_empty() && source_name != "No source selected";
+    
+    rsx! {
+        div { id: "control-panel",
+            // Source Selection
+            div { class: "control-section",
+                h3 { if has_source { "Change Source" } else { "Get Started" } }
+                button {
+                    class: "btn btn-primary",
+                    onclick: move |_| {
+                        let (tx, _, _, _, _, _, _) = get_global_state();
+                        if let Some(ref sender) = tx {
+                            let _ = sender.send(CaptureCommand::SelectSource);
+                        }
+                    },
+                    if has_source { "🔄 Select Different Source" } else { "🎬 Select Source to Record" }
+                }
+            }
+            
+            // Recording Controls - simplified
+            if has_source {
+                div { class: "control-section",
+                    h3 { "Recording" }
+                    div { class: "button-group",
+                        if is_recording {
+                            button {
+                                class: "btn btn-danger",
+                                onclick: move |_| {
+                                    let (tx, _, _, _, _, _, _) = get_global_state();
+                                    if let Some(ref sender) = tx {
+                                        let _ = sender.send(CaptureCommand::StopRecording);
+                                    }
+                                },
+                                "⏹️ Stop Recording"
+                            }
+                            p { style: "font-size: 0.875rem; color: #5F6368; margin-top: 0.5rem;",
+                                "Recording will be saved and uploaded automatically"
+                            }
+                        } else {
+                            button {
+                                class: "btn btn-success",
+                                onclick: move |_| {
+                                    let (tx, _, _, _, _, _, _) = get_global_state();
+                                    if let Some(ref sender) = tx {
+                                        let _ = sender.send(CaptureCommand::StartRecording);
+                                    }
+                                },
+                                disabled: !is_capturing,
+                                "⏺️ Start Recording"
+                            }
+                            p { style: "font-size: 0.875rem; color: #5F6368; margin-top: 0.5rem;",
+                                "Record your screen to video file"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn StatusBar(upload_status: String) -> Element {
+    let is_uploading = upload_status.contains("Uploading") || upload_status.contains("Creating");
+    let is_complete = upload_status.contains("Complete");
+    let is_error = upload_status.contains("Failed") || upload_status.contains("Error");
+    
+    let upload_icon = if is_uploading {
+        "📤"
+    } else if is_complete {
+        "✅"
+    } else if is_error {
+        "❌"
+    } else {
+        ""
     };
+    
+    let upload_class = if is_complete {
+        "status-value upload-complete"
+    } else if is_error {
+        "status-value upload-error"
+    } else {
+        "status-value upload-active"
+    };
+    
+    rsx! {
+        footer { id: "status-bar",
+            if !upload_status.is_empty() {
+                div { class: "status-item upload-status",
+                    if !upload_icon.is_empty() {
+                        span { style: "margin-right: 0.5rem;", "{upload_icon}" }
+                    }
+                    span { class: "{upload_class}", "{upload_status}" }
+                }
+            } else {
+                div { class: "status-item shortcuts",
+                    span { "Talka Recorder - Capture and upload your meetings" }
+                }
+            }
+        }
+    }
+}
 
-    let command_queue = device.new_command_queue();
-
-    // Create shared capture state
-    let capture_state = Arc::new(CaptureState::new());
-    let font = BitmapFont::new();
-    let mut overlay = OverlayState::new();
-    let capturing = Arc::new(AtomicBool::new(false));
-    let mut stream_config = default_stream_config();
-    let mut mic_device_idx: Option<usize> = None; // Track mic device selection separately
-
-    // Screen capture setup
+// Capture backend thread
+fn run_capture_backend(
+    cmd_rx: Receiver<CaptureCommand>,
+    is_capturing: Arc<AtomicBool>,
+    is_recording: Arc<AtomicBool>,
+    source_name: Arc<Mutex<String>>,
+    upload_status: Arc<Mutex<String>>,
+    runtime: tokio::runtime::Handle,
+    capture_state: Arc<CaptureState>,
+    auth_tokens: Arc<Mutex<Option<auth::AuthTokens>>>,
+) {
     let mut stream: Option<SCStream> = None;
     let mut current_filter: Option<SCContentFilter> = None;
-    // let mut capture_size: (u32, u32) = (1920, 1080);
-    // Force 720p recording
-    let mut capture_size: (u32, u32) = (1280, 720);
-    let mut picked_source = SCPickedSource::Unknown;
+    let stream_config = default_stream_config();
+    let mut capture_size = (1280u32, 720u32);
+    let pending_picker: Arc<Mutex<PickerResult>> = Arc::new(Mutex::new(None));
 
-    // Recording state (macOS 15.0+)
     #[cfg(feature = "macos_15_0")]
     let mut recording_state = RecordingState::new();
     #[cfg(feature = "macos_15_0")]
-    let mut recording_config = RecordingConfig::new();
-    #[cfg(feature = "macos_15_0")]
-    let recording = recording_state.recording_flag();
-    #[cfg(not(feature = "macos_15_0"))]
-    let recording = Arc::new(AtomicBool::new(false));
+    let recording_config = RecordingConfig::new();
 
-    // Shared state for picker callback results
-    let pending_picker: Arc<Mutex<PickerResult>> = Arc::new(Mutex::new(None));
-
-    let mut vertex_builder = VertexBufferBuilder::new();
-    let mut time = 0.0f32;
-
-    // Track if we should logout (use Arc for sharing across closure)
-    let should_logout = Arc::new(AtomicBool::new(false));
-    let should_logout_clone = Arc::clone(&should_logout);
-    let exit_code_ref = Arc::new(Mutex::new(0i32));
-    let exit_code_clone = Arc::clone(&exit_code_ref);
-
-    // Start authentication check in background
-    {
-        let auth_state_clone = Arc::clone(&auth_state);
-        let auth_tokens_clone = Arc::clone(&auth_tokens);
-        let runtime_clone = runtime_handle.clone();
-        
-        runtime_handle.spawn(async move {
-            // Try to load existing tokens
-            if let Some(cached_tokens) = auth::load_tokens() {
-                // If we have a refresh token, try to refresh
-                if !cached_tokens.refresh_token.is_empty() {
-                    match auth::refresh_access_token(&cached_tokens.refresh_token).await {
-                        Ok(new_tokens) => {
-                            // Save the refreshed tokens
-                            let _ = auth::save_tokens(&new_tokens);
-                            *auth_state_clone.lock().unwrap() = 
-                                AuthState::Authenticated(new_tokens.clone());
-                            *auth_tokens_clone.lock().unwrap() = Some(new_tokens);
-                            return;
-                        }
-                        Err(_) => {
-                            // Refresh failed, need new auth
-                        }
+    loop {
+        // First check for pending picker results (continuously polling)
+        if let Ok(mut pending) = pending_picker.try_lock() {
+            if let Some((filter, width, height, source)) = pending.take() {
+                // Update source info immediately
+                let source_display = format_picked_source(&source);
+                *source_name.lock().unwrap() = source_display.clone();
+                println!("✅ Source selected: {}", source_display);
+                
+                // If already capturing, update the filter live
+                if is_capturing.load(Ordering::Relaxed) {
+                    if let Some(ref s) = stream {
+                        let _ = s.update_content_filter(&filter);
+                        println!("🔄 Updated capture filter to new source");
                     }
-                } else if !cached_tokens.is_expired() {
-                    // Valid cached token
-                    *auth_state_clone.lock().unwrap() = 
-                        AuthState::Authenticated(cached_tokens.clone());
-                    *auth_tokens_clone.lock().unwrap() = Some(cached_tokens);
-                    return;
-                }
-            }
-
-            // No valid tokens - start device flow
-            match auth::start_device_flow().await {
-                Ok((verification_uri, user_code, device_response)) => {
-                    *auth_state_clone.lock().unwrap() = AuthState::NeedsAuth {
-                        verification_uri: verification_uri.clone(),
-                        user_code: user_code.clone(),
-                        device_code: device_response.device_code.clone(),
-                        poll_interval: device_response.interval,
-                    };
-
-                    // Start polling for token
-                    let device_code = device_response.device_code.clone();
-                    let poll_interval = device_response.interval;
+                } else {
+                    // Store filter and size for future capture
+                    current_filter = Some(filter.clone());
+                    capture_size = (width, height);
                     
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval)).await;
-                        
-                        match auth::poll_for_token(&device_code).await {
-                            Ok(mut tokens) => {
-                                tokens.update_expiration();
-                                let _ = auth::save_tokens(&tokens);
-                                *auth_state_clone.lock().unwrap() = 
-                                    AuthState::Authenticated(tokens.clone());
-                                *auth_tokens_clone.lock().unwrap() = Some(tokens);
-                                break;
-                            }
-                            Err(auth::AuthError::AuthorizationPending) => {
-                                // Keep waiting
-                                continue;
-                            }
-                            Err(auth::AuthError::SlowDown) => {
-                                // Slow down polling
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                continue;
-                            }
-                            Err(e) => {
-                                *auth_state_clone.lock().unwrap() = 
-                                    AuthState::Error(format!("{}", e));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    *auth_state_clone.lock().unwrap() = AuthState::Error(format!("{}", e));
+                    // Auto-start capture after picking (like original app)
+                    input::start_capture(
+                        &mut stream,
+                        Some(&filter),
+                        capture_size,
+                        &stream_config,
+                        &capture_state,
+                        &is_capturing,
+                        false,
+                    );
                 }
             }
-        });
-    }
-
-    // Event loop
-    event_loop.run(move |event, _, control_flow| {
-        autoreleasepool(|| {
-            *control_flow = ControlFlow::Poll;
-
-            // Check authentication state
-            let current_auth_state = auth_state.lock().unwrap().clone();
-            let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
-
-            // Only process picker results and normal app logic when authenticated
-            if is_authenticated {
-                // Check for pending picker results - auto-start capture after picking
-                if let Ok(mut pending) = pending_picker.try_lock() {
-                    if let Some((filter, width, height, source)) = pending.take() {
-                        // Force 720p recording, do not change the capture size by the screen size
-                        // capture_size = (width, height);
-                        picked_source = source;
-
-                        // If already capturing, update the filter live
-                        if capturing.load(Ordering::Relaxed) {
-                            if let Some(ref s) = stream {
-                                let _ = s.update_content_filter(&filter);
-                            }
-                            current_filter = Some(filter);
-                        } else {
-                            // Auto-start capture after picking
-                            current_filter = Some(filter);
-                            start_capture(
-                                &mut stream,
-                                current_filter.as_ref(),
-                                capture_size,
-                                &stream_config,
-                                &capture_state,
-                                &capturing,
-                                false,
-                            );
-                        }
-
-                        // Switch to full menu mode
-                        overlay.switch_to_full_menu();
+        }
+        
+        // Then check for commands (with timeout to continue polling)
+        if let Ok(cmd) = cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            match cmd {
+                CaptureCommand::SelectSource => {
+                    // Open picker (result will be handled in the polling loop above)
+                    if let Some(ref s) = stream {
+                        input::open_picker_for_stream(&pending_picker, s);
+                    } else {
+                        input::open_picker(&pending_picker);
                     }
+                    println!("📺 Opening content picker...");
                 }
-            }
-
-            match event {
-                Event::MainEventsCleared => window.request_redraw(),
-
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => {
-                        *exit_code_clone.lock().unwrap() = 0;
-                        *control_flow = ControlFlow::Exit;
-                    },
-
-                    WindowEvent::Resized(size) => {
-                        layer.set_drawable_size(CGSize::new(f64::from(size.width), f64::from(size.height)));
-                    }
-
-                    WindowEvent::KeyboardInput {
-                        input:
-                            winit::event::KeyboardInput {
-                                virtual_keycode: Some(keycode),
-                                state: ElementState::Pressed,
-                                ..
-                            },
-                        ..
-                    } => {
-                        // Check if authenticated before processing keys
-                        let current_auth_state = auth_state.lock().unwrap().clone();
-                        let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
-
-                        // If not authenticated, only allow quit
-                        if !is_authenticated {
-                            if matches!(keycode, VirtualKeyCode::Q | VirtualKeyCode::Escape) {
-                                *exit_code_clone.lock().unwrap() = 0;
-                                *control_flow = ControlFlow::Exit;
-                            }
-                            return;
-                        }
-
-                        // Handle menu navigation when help is shown
-                        #[cfg(feature = "macos_15_0")]
-                        let show_any_config = overlay.show_config || overlay.show_recording_config;
-                        #[cfg(not(feature = "macos_15_0"))]
-                        let show_any_config = overlay.show_config;
-
-                        if overlay.show_help && !show_any_config {
-                            let menu_items = overlay.menu_items();
-                            match keycode {
-                                VirtualKeyCode::Up => {
-                                    if overlay.menu_selection > 0 {
-                                        overlay.menu_selection -= 1;
-                                        println!(
-                                            "⬆️  Menu selection: {} ({})",
-                                            overlay.menu_selection,
-                                            menu_items[overlay.menu_selection]
-                                        );
-                                    }
-                                }
-                                VirtualKeyCode::Down => {
-                                    let max = overlay.menu_count().saturating_sub(1);
-                                    if overlay.menu_selection < max {
-                                        overlay.menu_selection += 1;
-                                        println!(
-                                            "⬇️  Menu selection: {} ({})",
-                                            overlay.menu_selection,
-                                            menu_items[overlay.menu_selection]
-                                        );
-                                    }
-                                }
-                                VirtualKeyCode::Return | VirtualKeyCode::Space => {
-                                    let selected_item = menu_items[overlay.menu_selection];
-                                    match selected_item {
-                                        "Pick Source" | "Change Source" => {
-                                            // Open picker
-                                            if let Some(ref s) = stream {
-                                                open_picker_for_stream(&pending_picker, s);
-                                            } else {
-                                                open_picker(&pending_picker);
-                                            }
-                                        }
-                                        "Capture" => {
-                                            // Toggle capture
-                                            if capturing.load(Ordering::Relaxed) {
-                                                stop_capture(&mut stream, &capturing);
-                                            } else {
-                                                start_capture(
-                                                    &mut stream,
-                                                    current_filter.as_ref(),
-                                                    capture_size,
-                                                    &stream_config,
-                                                    &capture_state,
-                                                    &capturing,
-                                                    false,
-                                                );
-                                            }
-                                        }
-                                        "Screenshot" => {
-                                            if let Some(ref filter) = current_filter {
-                                                take_screenshot(filter, capture_size, &stream_config);
-                                            } else {
-                                                println!("⚠️  Select a source first");
-                                            }
-                                        }
-                                        "Record" => {
-                                            #[cfg(feature = "macos_15_0")]
-                                            {
-                                                if recording_state.is_active() {
-                                                    if let Some(ref s) = stream {
-                                                        if let Some(file_path) = recording_state.stop(s) {
-                                                            // Refresh token and upload
-                                                            let tokens_opt = auth_tokens.lock().unwrap().clone();
-                                                            if let Some(tokens) = tokens_opt {
-                                                                let runtime_clone = runtime_handle.clone();
-                                                                let recording_state_clone = recording_state.clone();
-                                                                
-                                                                runtime_handle.spawn(async move {
-                                                                    // Refresh access token if needed
-                                                                    let access_token = if tokens.is_expired() {
-                                                                        match auth::refresh_access_token(&tokens.refresh_token).await {
-                                                                            Ok(new_tokens) => new_tokens.access_token,
-                                                                            Err(_) => tokens.access_token,
-                                                                        }
-                                                                    } else {
-                                                                        tokens.access_token
-                                                                    };
-                                                                    
-                                                                    // Start upload
-                                                                    recording_state_clone.start_upload(
-                                                                        file_path,
-                                                                        access_token,
-                                                                        runtime_clone,
-                                                                    );
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                } else if stream.is_some() {
-                                                    if let Some(ref s) = stream {
-                                                        if let Err(e) = recording_state.start(s, &recording_config) {
-                                                            eprintln!("❌ {e}");
-                                                        }
-                                                    }
-                                                } else {
-                                                    println!("⚠️  Start capture first");
-                                                }
-                                            }
-                                            #[cfg(not(feature = "macos_15_0"))]
-                                            {
-                                                println!("⚠️  Recording requires macOS 15.0+");
-                                            }
-                                        }
-                                        "Config" => {
-                                            overlay.show_config = true;
-                                            overlay.show_help = false;
-                                        }
-                                        "Rec Config" => {
-                                            #[cfg(feature = "macos_15_0")]
-                                            {
-                                                overlay.show_recording_config = true;
-                                                overlay.show_help = false;
-                                            }
-                                        }
-                                        "Logout" => {
-                                            let _ = auth::logout();
-                                            
-                                            // Signal logout and exit with special code
-                                            should_logout_clone.store(true, Ordering::Relaxed);
-                                            *exit_code_clone.lock().unwrap() = EXIT_CODE_LOGOUT;
-                                            *control_flow = ControlFlow::Exit;
-                                        }
-                                        "Quit" => {
-                                            *exit_code_clone.lock().unwrap() = 0;
-                                            *control_flow = ControlFlow::Exit;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                VirtualKeyCode::Escape | VirtualKeyCode::H => {
-                                    overlay.show_help = false;
-                                }
-                                VirtualKeyCode::Q => {
-                                    *exit_code_clone.lock().unwrap() = 0;
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Handle config menu navigation
-                        else if overlay.show_config {
-                            match keycode {
-                                VirtualKeyCode::Up => {
-                                    if overlay.config_selection > 0 {
-                                        overlay.config_selection -= 1;
-                                    }
-                                }
-                                VirtualKeyCode::Down => {
-                                    let max = ConfigMenu::option_count().saturating_sub(1);
-                                    if overlay.config_selection < max {
-                                        overlay.config_selection += 1;
-                                    }
-                                }
-                                VirtualKeyCode::Left | VirtualKeyCode::Right => {
-                                    let increase = keycode == VirtualKeyCode::Right;
-                                    ConfigMenu::toggle_or_adjust(
-                                        &mut stream_config,
-                                        &mut mic_device_idx,
-                                        overlay.config_selection,
-                                        increase,
-                                    );
-                                    // Immediately apply config to running stream
-                                    if capturing.load(Ordering::Relaxed) {
-                                        if let Some(ref s) = stream {
-                                            let mut new_config = stream_config.clone();
-                                            new_config.set_width(capture_size.0);
-                                            new_config.set_height(capture_size.1);
-                                            if let Err(e) = s.update_configuration(&new_config) {
-                                                eprintln!("❌ Config update failed: {e:?}");
-                                            }
-                                        }
-                                    }
-                                }
-                                VirtualKeyCode::Return | VirtualKeyCode::Space => {
-                                    // Toggle current option (same as Right arrow)
-                                    ConfigMenu::toggle_or_adjust(
-                                        &mut stream_config,
-                                        &mut mic_device_idx,
-                                        overlay.config_selection,
-                                        true,
-                                    );
-                                    if capturing.load(Ordering::Relaxed) {
-                                        if let Some(ref s) = stream {
-                                            let mut new_config = stream_config.clone();
-                                            new_config.set_width(capture_size.0);
-                                            new_config.set_height(capture_size.1);
-                                            if let Err(e) = s.update_configuration(&new_config) {
-                                                eprintln!("❌ Config update failed: {e:?}");
-                                            }
-                                        }
-                                    }
-                                }
-                                VirtualKeyCode::Escape | VirtualKeyCode::Back => {
-                                    overlay.show_config = false;
-                                    overlay.show_help = true;
-                                }
-                                VirtualKeyCode::Q => {
-                                    *exit_code_clone.lock().unwrap() = 0;
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Handle recording config menu navigation (macOS 15.0+)
-                        #[cfg(feature = "macos_15_0")]
-                        if overlay.show_recording_config {
-                            use crate::recording::RecordingConfigMenu;
-
-                            match keycode {
-                                VirtualKeyCode::Up => {
-                                    if overlay.recording_config_selection > 0 {
-                                        overlay.recording_config_selection -= 1;
-                                    }
-                                }
-                                VirtualKeyCode::Down => {
-                                    let max = RecordingConfigMenu::option_count().saturating_sub(1);
-                                    if overlay.recording_config_selection < max {
-                                        overlay.recording_config_selection += 1;
-                                    }
-                                }
-                                VirtualKeyCode::Left | VirtualKeyCode::Right => {
-                                    let increase = keycode == VirtualKeyCode::Right;
-                                    RecordingConfigMenu::toggle_or_adjust(
-                                        &mut recording_config,
-                                        overlay.recording_config_selection,
-                                        increase,
-                                    );
-                                }
-                                VirtualKeyCode::Return | VirtualKeyCode::Space => {
-                                    RecordingConfigMenu::toggle_or_adjust(
-                                        &mut recording_config,
-                                        overlay.recording_config_selection,
-                                        true,
-                                    );
-                                }
-                                VirtualKeyCode::Escape | VirtualKeyCode::Back => {
-                                    overlay.show_recording_config = false;
-                                    overlay.show_help = true;
-                                }
-                                VirtualKeyCode::Q => {
-                                    *exit_code_clone.lock().unwrap() = 0;
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Default key handling (no menu shown)
-                        else if !overlay.show_help && !show_any_config {
-                            match keycode {
-                                VirtualKeyCode::Space => {
-                                    // Toggle capture on/off
-                                    if capturing.load(Ordering::Relaxed) {
-                                        stop_capture(&mut stream, &capturing);
-                                    } else {
-                                        start_capture(
-                                            &mut stream,
-                                            current_filter.as_ref(),
-                                            capture_size,
-                                            &stream_config,
-                                            &capture_state,
-                                            &capturing,
-                                            false,
-                                        );
-                                    }
-                                }
-                                VirtualKeyCode::P => {
-                                    if let Some(ref s) = stream {
-                                        open_picker_for_stream(&pending_picker, s);
-                                    } else {
-                                        open_picker(&pending_picker);
-                                    }
-                                }
-                                VirtualKeyCode::W => {
-                                    overlay.show_waveform = !overlay.show_waveform;
-                                }
-                                VirtualKeyCode::H => {
-                                    overlay.show_help = true;
-                                }
-                                VirtualKeyCode::C => {
-                                    overlay.show_config = true;
-                                }
-                                VirtualKeyCode::M => {
-                                    let new_val = !stream_config.captures_microphone();
-                                    stream_config.set_captures_microphone(new_val);
-                                    println!(
-                                        "🎤 Microphone: {}",
-                                        if new_val { "On" } else { "Off" }
-                                    );
-                                    if capturing.load(Ordering::Relaxed) {
-                                        if let Some(ref s) = stream {
-                                            let mut new_config = stream_config.clone();
-                                            new_config.set_width(capture_size.0);
-                                            new_config.set_height(capture_size.1);
-                                            match s.update_configuration(&new_config) {
-                                                Ok(()) => println!("✅ Config updated"),
-                                                Err(e) => {
-                                                    eprintln!("❌ Config update failed: {e:?}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                VirtualKeyCode::S => {
-                                    // Screenshot shortcut
-                                    if let Some(ref filter) = current_filter {
-                                        take_screenshot(filter, capture_size, &stream_config);
-                                    } else {
-                                        println!("⚠️  Select a source first with P or menu");
-                                    }
-                                }
-                                VirtualKeyCode::R => {
-                                    // Recording shortcut (macOS 15.0+)
-                                    #[cfg(feature = "macos_15_0")]
-                                    {
-                                        if recording_state.is_active() {
-                                            // Stop recording
-                                            if let Some(ref s) = stream {
-                                                if let Some(file_path) = recording_state.stop(s) {
-                                                    // Refresh token and upload
-                                                    let tokens_opt = auth_tokens.lock().unwrap().clone();
-                                                    if let Some(tokens) = tokens_opt {
-                                                        let runtime_clone = runtime_handle.clone();
-                                                        let recording_state_clone = recording_state.clone();
-                                                        
-                                                        runtime_handle.spawn(async move {
-                                                            // Refresh access token if needed
-                                                            let access_token = if tokens.is_expired() {
-                                                                match auth::refresh_access_token(&tokens.refresh_token).await {
-                                                                    Ok(new_tokens) => new_tokens.access_token,
-                                                                    Err(_) => tokens.access_token,
-                                                                }
-                                                            } else {
-                                                                tokens.access_token
-                                                            };
-                                                            
-                                                            // Start upload
-                                                            recording_state_clone.start_upload(
-                                                                file_path,
-                                                                access_token,
-                                                                runtime_clone,
-                                                            );
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        } else if current_filter.is_some() && stream.is_some() {
-                                            // Start recording
-                                            if let Some(ref s) = stream {
-                                                match recording_state.start(s, &recording_config) {
-                                                    Ok(path) => println!("🔴 Recording to: {path}"),
-                                                    Err(e) => eprintln!("❌ {e}"),
-                                                }
-                                            }
-                                        }
-                                    }
-                                    #[cfg(not(feature = "macos_15_0"))]
-                                    {
-                                        // Recording not available
-                                    }
-                                }
-                                VirtualKeyCode::Escape | VirtualKeyCode::Q => {
-                                    *exit_code_clone.lock().unwrap() = 0;
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-
-                Event::RedrawRequested(_) => {
-                    time += 0.016;
-
-                    let size = window.inner_size();
-                    let width = size.width as f32;
-                    let height = size.height as f32;
-
-                    // Check authentication state
-                    let current_auth_state = auth_state.lock().unwrap().clone();
-                    let is_authenticated = matches!(current_auth_state, AuthState::Authenticated(_));
-
-                    // Try to get the latest IOSurface and create textures from it (zero-copy)
-                    let mut capture_textures: Option<CaptureTextures> = None;
-                    let mut tex_width = capture_size.0 as f32;
-                    let mut tex_height = capture_size.1 as f32;
-                    let mut pixel_format: u32 = 0;
-
-                    if is_authenticated && capturing.load(Ordering::Relaxed) {
-                        if let Ok(guard) = capture_state.latest_surface.try_lock() {
-                            if let Some(ref surface) = *guard {
-                                tex_width = surface.width() as f32;
-                                tex_height = surface.height() as f32;
-                                // Create Metal textures directly from IOSurface (zero-copy)
-                                capture_textures = unsafe {
-                                    create_textures_from_iosurface(&device, surface.as_ptr())
-                                };
-                                if let Some(ref ct) = capture_textures {
-                                    pixel_format = ct.pixel_format;
-                                }
-                            }
-                        }
-                    }
-
-                    // Build vertex buffer for this frame
-                    vertex_builder.clear();
-
-                    // Show authentication screen if not authenticated
-                    if !is_authenticated {
-                        match current_auth_state {
-                            AuthState::CheckingCache => {
-                                vertex_builder.auth_overlay(&font, width, height, "checking", None, None);
-                            }
-                            AuthState::NeedsAuth { ref verification_uri, ref user_code, .. } => {
-                                vertex_builder.auth_overlay(
-                                    &font, 
-                                    width, 
-                                    height, 
-                                    "needs_auth", 
-                                    Some(verification_uri), 
-                                    Some(user_code)
-                                );
-                            }
-                            AuthState::Authenticating => {
-                                vertex_builder.auth_overlay(&font, width, height, "authenticating", None, None);
-                            }
-                            AuthState::Error(_) => {
-                                vertex_builder.auth_overlay(&font, width, height, "error", None, None);
-                            }
-                            AuthState::Authenticated(_) => {
-                                // Already handled, shouldn't reach here
-                            }
-                        }
-                    } else {
-                        // Normal app UI - only when authenticated
-
-                    // Status bar background
-                    // vertex_builder.rect(0.0, 0.0, width, 32.0, [0.1, 0.1, 0.12, 0.9]);
-
-                    // Status text - include audio sample counts and peaks for debugging
-                    let fps = capture_state.frame_count.load(Ordering::Relaxed);
-                    let audio_samples_cnt =
-                        capture_state.audio_waveform.lock().unwrap().sample_count();
-                    let mic_samples_cnt = capture_state.mic_waveform.lock().unwrap().sample_count();
-                    let audio_peak = capture_state.audio_waveform.lock().unwrap().peak(512);
-                    let mic_peak = capture_state.mic_waveform.lock().unwrap().peak(512);
-                    let status = if capture_textures.is_some() {
-                        format!(
-                            "LIVE {}x{} F:{} A:{}k P:{:.2} M:{}k P:{:.2}",
-                            tex_width as u32,
-                            tex_height as u32,
-                            fps,
-                            audio_samples_cnt / 1000,
-                            audio_peak,
-                            mic_samples_cnt / 1000,
-                            mic_peak
-                        )
-                    } else if capturing.load(Ordering::Relaxed) {
-                        format!("Starting... {fps}")
-                    } else {
-                        "H=Menu".to_string()
-                    };
-                    // Hide status text for now
-                    // vertex_builder.text(&font, &status, 8.0, 8.0, 2.0, [0.2, 1.0, 0.3, 1.0]);
-
-                    // Waveform bar at top - 100% width with both system audio and mic
-                    // if overlay.show_waveform && capturing.load(Ordering::Relaxed) {
-                    //     let single_wave_h = 40.0;
-                    //     let wave_spacing = 4.0;
-                    //     let total_wave_h = single_wave_h * 2.0 + wave_spacing;
-                    //     let bar_y = 36.0; // Below status bar
-                    //     let meter_w = 24.0;
-                    //     let padding = 8.0;
-                    //     let label_w = 24.0; // Space for labels
-
-                    //     // Waveform background - full width
-                    //     vertex_builder.rect(
-                    //         0.0,
-                    //         bar_y,
-                    //         width,
-                    //         total_wave_h + 12.0,
-                    //         [0.08, 0.08, 0.1, 0.9],
-                    //     );
-
-                    //     // Calculate waveform area (leave space for labels on left and meters on right)
-                    //     let meters_space = meter_w * 2.0 + padding * 3.0;
-                    //     let wave_w = width - meters_space - padding - label_w;
-                    //     let wave_x = padding + label_w;
-
-                    //     // System audio waveform (top) - cyan/green
-                    //     let audio_wave_y = bar_y + 4.0;
-                    //     vertex_builder.text(
-                    //         &font,
-                    //         "SYS",
-                    //         padding,
-                    //         audio_wave_y + single_wave_h / 2.0 - 4.0,
-                    //         1.0,
-                    //         [0.0, 0.9, 0.8, 0.7],
-                    //     );
-                    //     let audio_samples =
-                    //         capture_state.audio_waveform.lock().unwrap().display_samples(512);
-                    //     vertex_builder.waveform(
-                    //         &audio_samples,
-                    //         wave_x,
-                    //         audio_wave_y,
-                    //         wave_w,
-                    //         single_wave_h,
-                    //         [0.0, 0.9, 0.8, 0.9], // Cyan (system audio)
-                    //     );
-
-                    //     // Microphone waveform (bottom) - magenta/pink
-                    //     let mic_wave_y = audio_wave_y + single_wave_h + wave_spacing;
-                    //     vertex_builder.text(
-                    //         &font,
-                    //         "MIC",
-                    //         padding,
-                    //         mic_wave_y + single_wave_h / 2.0 - 4.0,
-                    //         1.0,
-                    //         [1.0, 0.3, 0.7, 0.7],
-                    //     );
-                    //     let mic_samples =
-                    //         capture_state.mic_waveform.lock().unwrap().display_samples(512);
-                    //     vertex_builder.waveform(
-                    //         &mic_samples,
-                    //         wave_x,
-                    //         mic_wave_y,
-                    //         wave_w,
-                    //         single_wave_h,
-                    //         [1.0, 0.3, 0.7, 0.9], // Magenta (mic)
-                    //     );
-
-                    //     // Vertical meters on the right
-                    //     let meters_x = width - meters_space + padding;
-
-                    //     // System audio vertical meter
-                    //     let audio_level = capture_state.audio_waveform.lock().unwrap().rms(2048);
-                    //     vertex_builder.vu_meter_vertical(
-                    //         audio_level,
-                    //         meters_x,
-                    //         audio_wave_y,
-                    //         meter_w,
-                    //         total_wave_h,
-                    //         "S",
-                    //         &font,
-                    //     );
-
-                    //     // Microphone vertical meter
-                    //     let mic_level = capture_state.mic_waveform.lock().unwrap().rms(2048);
-                    //     vertex_builder.vu_meter_vertical(
-                    //         mic_level,
-                    //         meters_x + meter_w + padding,
-                    //         audio_wave_y,
-                    //         meter_w,
-                    //         total_wave_h,
-                    //         "M",
-                    //         &font,
-                    //     );
-                    // }
-
-                    // Help overlay - responsive centered
-                    if overlay.show_help {
-                        let source_str = format_picked_source(&picked_source);
-                        vertex_builder.help_overlay(
-                            &font,
-                            width,
-                            height,
-                            capturing.load(Ordering::Relaxed),
-                            recording.load(Ordering::Relaxed),
-                            &source_str,
-                            overlay.menu_selection,
-                            overlay.menu_items(),
-                        );
-                    }
-
-                    // Config menu overlay
-                    if overlay.show_config {
-                        let source_str = format_picked_source(&picked_source);
-                        vertex_builder.config_menu(
-                            &font,
-                            width,
-                            height,
+                CaptureCommand::StartCapture => {
+                    if current_filter.is_some() {
+                        input::start_capture(
+                            &mut stream,
+                            current_filter.as_ref(),
+                            capture_size,
                             &stream_config,
-                            mic_device_idx,
-                            overlay.config_selection,
-                            capturing.load(Ordering::Relaxed),
-                            &source_str,
+                            &capture_state,
+                            &is_capturing,
+                            false,
                         );
+                    } else {
+                        println!("⚠️ No source selected. Please select a source first.");
                     }
-
-                    // Recording config menu overlay (macOS 15.0+)
+                }
+                CaptureCommand::StopCapture => {
+                    input::stop_capture(&mut stream, &is_capturing);
+                }
+                CaptureCommand::TakeScreenshot => {
+                    if is_capturing.load(Ordering::Relaxed) {
+                        println!("📸 Taking screenshot...");
+                        // Screenshot logic would go here
+                    }
+                }
+                CaptureCommand::StartRecording => {
                     #[cfg(feature = "macos_15_0")]
-                    if overlay.show_recording_config {
-                        vertex_builder.recording_config_menu(
-                            &font,
-                            width,
-                            height,
-                            &recording_config,
-                            overlay.recording_config_selection,
-                        );
+                    if is_capturing.load(Ordering::Relaxed) {
+                        if let Some(ref s) = stream {
+                            match recording_state.start(s, &recording_config) {
+                                Ok(path) => {
+                                    is_recording.store(true, Ordering::Relaxed);
+                                    println!("⏺ Recording started: {}", path);
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Failed to start recording: {}", e);
+                                }
+                            }
+                        }
                     }
-
-                    // Upload status overlay (macOS 15.0+)
+                }
+                CaptureCommand::StopRecording => {
                     #[cfg(feature = "macos_15_0")]
                     {
-                        let upload_status = recording_state.upload_status.lock().unwrap().clone();
-                        vertex_builder.upload_status_overlay(&font, width, height, &upload_status);
-                    }
-
-                    } // End of authenticated UI block
-
-                    // Build GPU buffer
-                    let vertex_buffer = vertex_builder.build(&device);
-                    vertex_buffer.did_modify_range(metal::NSRange::new(
-                        0,
-                        (vertex_builder.vertex_count() * size_of::<Vertex>()) as u64,
-                    ));
-
-                    // Uniforms - pass capture texture dimensions for aspect ratio
-                    let uniforms = Uniforms {
-                        viewport_size: [width, height],
-                        texture_size: [tex_width, tex_height],
-                        time,
-                        pixel_format,
-                        _padding: [0.0; 2],
-                    };
-                    let uniforms_buffer = device.new_buffer_with_data(
-                        std::ptr::addr_of!(uniforms).cast(),
-                        size_of::<Uniforms>() as u64,
-                        MTLResourceOptions::CPUCacheModeDefaultCache,
-                    );
-
-                    // Render
-                    let Some(drawable) = layer.next_drawable() else {
-                        return;
-                    };
-
-                    let render_pass = RenderPassDescriptor::new();
-                    let attachment = render_pass.color_attachments().object_at(0).unwrap();
-                    attachment.set_texture(Some(drawable.texture()));
-                    attachment.set_load_action(MTLLoadAction::Clear);
-                    attachment.set_clear_color(MTLClearColor::new(0.08, 0.08, 0.1, 1.0));
-                    attachment.set_store_action(MTLStoreAction::Store);
-
-                    let cmd_buffer = command_queue.new_command_buffer();
-                    let encoder = cmd_buffer.new_render_command_encoder(render_pass);
-
-                    // First pass: Draw captured frame as background (if available)
-                    if let Some(ref textures) = capture_textures {
-                        let is_ycbcr = textures.pixel_format == PIXEL_FORMAT_420V
-                            || textures.pixel_format == PIXEL_FORMAT_420F;
-
-                        if is_ycbcr && textures.plane1.is_some() {
-                            // Use YCbCr pipeline for biplanar formats
-                            encoder.set_render_pipeline_state(&ycbcr_pipeline);
-                            encoder.set_vertex_buffer(0, Some(&uniforms_buffer), 0);
-                            encoder.set_fragment_texture(0, Some(&textures.plane0));
-                            encoder
-                                .set_fragment_texture(1, Some(textures.plane1.as_ref().unwrap()));
-                            encoder.set_fragment_buffer(0, Some(&uniforms_buffer), 0);
+                        if let Some(ref s) = stream {
+                            println!("⏹ Stopping recording...");
+                            if let Some(path) = recording_state.stop(s) {
+                                is_recording.store(false, Ordering::Relaxed);
+                                println!("✅ Recording stopped and saved: {}", path);
+                                
+                                // Trigger upload to Talka backend
+                                let tokens_opt = auth_tokens.lock().unwrap().clone();
+                                if let Some(tokens) = tokens_opt {
+                                    println!("🚀 Starting upload to Talka backend...");
+                                    *upload_status.lock().unwrap() = "Preparing upload...".to_string();
+                                    
+                                    let runtime_clone = runtime.clone();
+                                    let recording_state_clone = recording_state.clone();
+                                    let upload_status_clone = Arc::clone(&upload_status);
+                                    
+                                    runtime.spawn(async move {
+                                        // Refresh access token if needed
+                                        let access_token = if tokens.is_expired() {
+                                            println!("🔄 Refreshing access token...");
+                                            match auth::refresh_access_token(&tokens.refresh_token).await {
+                                                Ok(new_tokens) => {
+                                                    println!("✅ Token refreshed");
+                                                    let _ = auth::save_tokens(&new_tokens);
+                                                    new_tokens.access_token
+                                                }
+                                                Err(e) => {
+                                                    println!("⚠️ Token refresh failed: {}, using old token", e);
+                                                    tokens.access_token
+                                                }
+                                            }
+                                        } else {
+                                            tokens.access_token
+                                        };
+                                        
+                                        // Start upload with status updates
+                                        println!("📤 Uploading file: {}", path);
+                                        recording_state_clone.start_upload(
+                                            path,
+                                            access_token,
+                                            runtime_clone,
+                                        );
+                                        
+                                        // Monitor upload status and update UI
+                                        loop {
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                            let current_status = recording_state_clone.upload_status.lock().unwrap().clone();
+                                            
+                                            let status_text = current_status.as_display_string();
+                                            if !status_text.is_empty() {
+                                                *upload_status_clone.lock().unwrap() = status_text.clone();
+                                            }
+                                            
+                                            // Stop monitoring if complete or failed
+                                            if matches!(current_status, upload::UploadStatus::Complete | upload::UploadStatus::Failed(_)) {
+                                                println!("📊 Upload finished: {:?}", current_status);
+                                                // Clear status after 5 seconds
+                                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                                *upload_status_clone.lock().unwrap() = String::new();
+                                                break;
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    println!("⚠️ No authentication tokens available for upload");
+                                    *upload_status.lock().unwrap() = "Upload skipped: Not authenticated".to_string();
+                                    std::thread::sleep(std::time::Duration::from_secs(3));
+                                    *upload_status.lock().unwrap() = String::new();
+                                }
+                            } else {
+                                println!("⚠️ No recording to stop");
+                            }
                         } else {
-                            // Use standard BGRA/RGB pipeline
-                            encoder.set_render_pipeline_state(&fullscreen_pipeline);
-                            encoder.set_vertex_buffer(0, Some(&uniforms_buffer), 0);
-                            encoder.set_fragment_texture(0, Some(&textures.plane0));
+                            println!("⚠️ No active stream");
                         }
-                        encoder.draw_primitives(MTLPrimitiveType::TriangleStrip, 0, 4);
                     }
-
-                    // Second pass: Draw overlay UI
-                    encoder.set_render_pipeline_state(&overlay_pipeline);
-                    encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
-                    encoder.set_vertex_buffer(1, Some(&uniforms_buffer), 0);
-                    encoder.draw_primitives(
-                        MTLPrimitiveType::Triangle,
-                        0,
-                        vertex_builder.vertex_count() as u64,
-                    );
-                    encoder.end_encoding();
-
-                    cmd_buffer.present_drawable(drawable);
-                    cmd_buffer.commit();
+                    #[cfg(not(feature = "macos_15_0"))]
+                    {
+                        println!("⚠️ Recording not available (requires macOS 15.0+)");
+                    }
                 }
-                _ => {}
+                CaptureCommand::ToggleMicrophone => {
+                    println!("🎤 Toggle microphone");
+                }
+                CaptureCommand::Quit => {
+                    break;
+                }
+                CaptureCommand::Logout => {
+                    break;
+                }
             }
-        });
-    });
+        }
+    }
+}
+
+/// Helper to copy text to clipboard (macOS specific)
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::process::Command;
     
-    // Return the exit code
-    *exit_code_ref.lock().unwrap()
+    let mut child = Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn pbcopy: {}", e))?;
+    
+    use std::io::Write;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())
+            .map_err(|e| format!("Failed to write to pbcopy: {}", e))?;
+    }
+    
+    child.wait().map_err(|e| format!("Failed to wait for pbcopy: {}", e))?;
+    println!("📋 Copied to clipboard: {}", text);
+    Ok(())
+}
+
+async fn authenticate_user_with_ui(auth_state: &Arc<Mutex<AuthState>>) -> Result<(auth::AuthTokens, auth::UserProfile), String> {
+    // Try to load existing tokens and validate with profile fetch
+    if let Some(cached_tokens) = auth::load_tokens() {
+        if !cached_tokens.is_expired() {
+            // Try to fetch profile to validate token
+            match auth::get_user_profile(&cached_tokens.access_token).await {
+                Ok(profile) => {
+                    println!("✅ Loaded cached tokens and profile");
+                    return Ok((cached_tokens, profile));
+                }
+                Err(_) => {
+                    println!("⚠️ Cached token invalid, refreshing...");
+                }
+            }
+        }
+        
+        // Try to refresh
+        if !cached_tokens.refresh_token.is_empty() {
+            match auth::refresh_access_token(&cached_tokens.refresh_token).await {
+                Ok(new_tokens) => {
+                    let _ = auth::save_tokens(&new_tokens);
+                    // Fetch profile
+                    match auth::get_user_profile(&new_tokens.access_token).await {
+                        Ok(profile) => {
+                            println!("✅ Refreshed tokens and fetched profile");
+                            return Ok((new_tokens, profile));
+                        }
+                        Err(_) => {
+                            println!("⚠️ Failed to fetch profile after refresh");
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("⚠️ Token refresh failed, need new login");
+                }
+            }
+        }
+    }
+
+    // Start device flow
+    let (verification_uri, user_code, device_response) = auth::start_device_flow()
+        .await
+        .map_err(|e| format!("Failed to start auth: {}", e))?;
+
+    println!("🔐 Please authenticate:");
+    println!("   URL: {}", verification_uri);
+    println!("   Code: {}", user_code);
+
+    // Update UI state to show login screen
+    *auth_state.lock().unwrap() = AuthState::NeedsAuth {
+        verification_uri: verification_uri.clone(),
+        user_code: user_code.clone(),
+    };
+
+    // Poll for completion
+    let start_time = std::time::Instant::now();
+    let expires_at = start_time + std::time::Duration::from_secs(device_response.expires_in);
+    let mut poll_interval = std::time::Duration::from_secs(device_response.interval);
+
+    loop {
+        if std::time::Instant::now() >= expires_at {
+            return Err("Device code expired".to_string());
+        }
+
+        tokio::time::sleep(poll_interval).await;
+
+        match auth::poll_for_token(&device_response.device_code).await {
+            Ok(mut tokens) => {
+                tokens.update_expiration();
+                let _ = auth::save_tokens(&tokens);
+                
+                // Update UI state
+                *auth_state.lock().unwrap() = AuthState::Authenticating;
+                
+                // Fetch user profile
+                match auth::get_user_profile(&tokens.access_token).await {
+                    Ok(profile) => {
+                        println!("✅ Authentication complete!");
+                        return Ok((tokens, profile));
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to fetch user profile: {}", e));
+                    }
+                }
+            }
+            Err(auth::AuthError::AuthorizationPending) => {
+                // Keep waiting
+            }
+            Err(auth::AuthError::SlowDown) => {
+                poll_interval += std::time::Duration::from_secs(5);
+            }
+            Err(e) => {
+                return Err(format!("Auth failed: {}", e));
+            }
+        }
+    }
 }

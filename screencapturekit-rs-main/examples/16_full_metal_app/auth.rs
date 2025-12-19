@@ -326,6 +326,80 @@ pub fn load_tokens() -> Option<AuthTokens> {
     }
 }
 
+/// User profile information from Auth0
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserProfile {
+    pub sub: String, // User ID
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub picture: String,
+    #[serde(default)]
+    pub nickname: String,
+}
+
+impl UserProfile {
+    /// Get user initials for avatar
+    pub fn initials(&self) -> String {
+        if !self.name.is_empty() {
+            self.name
+                .split_whitespace()
+                .take(2)
+                .filter_map(|s| s.chars().next())
+                .collect::<String>()
+                .to_uppercase()
+        } else if !self.email.is_empty() {
+            self.email.chars().next().unwrap().to_uppercase().to_string()
+        } else {
+            "U".to_string()
+        }
+    }
+
+    /// Get display name
+    pub fn display_name(&self) -> String {
+        if !self.name.is_empty() {
+            self.name.clone()
+        } else if !self.nickname.is_empty() {
+            self.nickname.clone()
+        } else if !self.email.is_empty() {
+            self.email.split('@').next().unwrap_or("User").to_string()
+        } else {
+            "User".to_string()
+        }
+    }
+}
+
+/// Fetch user profile from Auth0
+pub async fn get_user_profile(access_token: &str) -> Result<UserProfile, AuthError> {
+    let client = reqwest::Client::new();
+    let url = format!("https://{}/userinfo", AUTH0_DOMAIN);
+
+    let response = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| AuthError::NetworkError(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AuthError::NetworkError(format!(
+            "Failed to fetch user profile: HTTP {}: {}",
+            status, text
+        )));
+    }
+
+    let profile: UserProfile = response
+        .json()
+        .await
+        .map_err(|e| AuthError::NetworkError(format!("Failed to parse profile: {}", e)))?;
+
+    Ok(profile)
+}
+
 /// Logout - delete stored tokens
 pub fn logout() -> Result<(), std::io::Error> {
     let path = get_token_file_path();
