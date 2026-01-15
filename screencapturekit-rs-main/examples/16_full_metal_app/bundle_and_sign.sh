@@ -35,7 +35,7 @@ else
 fi
 
 # Navigate to project root
-cd /Users/x/Documents/git/talka_recorder_rst/screencapturekit-rs-main
+cd /Users/linsun/Desktop/talka_recorder_rst/screencapturekit-rs-main
 
 # Build using cargo-bundle
 echo "🏗️  Building with cargo-bundle (release mode, macos_15_0 features)..."
