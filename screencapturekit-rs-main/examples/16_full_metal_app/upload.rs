@@ -15,7 +15,7 @@ pub enum UploadStatus {
     CreatingFile,
     UploadingFile { percent: u8 },
     CreatingMetadata,
-    Complete,
+    Complete { file_id: String },
     Failed(String),
 }
 
@@ -28,12 +28,26 @@ impl Default for UploadStatus {
 impl UploadStatus {
     pub fn as_display_string(&self) -> String {
         match self {
-            Self::Idle => "Ready".to_string(),
-            Self::CreatingFile => "Creating file entry...".to_string(),
-            Self::UploadingFile { percent } => format!("Uploading... {}%", percent),
-            Self::CreatingMetadata => "Creating metadata...".to_string(),
-            Self::Complete => "Upload complete!".to_string(),
-            Self::Failed(err) => format!("Upload failed: {}", err),
+            Self::Idle => String::new(),
+            Self::CreatingFile => "Preparing your recording".to_string(),
+            Self::UploadingFile { percent } => {
+                if *percent < 100 {
+                    format!("{}% uploaded", percent)
+                } else {
+                    "Finalizing upload".to_string()
+                }
+            },
+            Self::CreatingMetadata => "Processing recording".to_string(),
+            Self::Complete { .. } => "Your recording is ready".to_string(),
+            Self::Failed(err) => {
+                if err.contains("network") || err.contains("connection") {
+                    "Connection lost. Please try again.".to_string()
+                } else if err.contains("auth") || err.contains("token") {
+                    "Authentication failed. Please log in again.".to_string()
+                } else {
+                    "Something went wrong. Please try again.".to_string()
+                }
+            },
         }
     }
 }
@@ -280,7 +294,7 @@ pub async fn upload_recording(
     let metadata = CallMetadata {
         title,
         recorded_datetime: Some(chrono::Utc::now().to_rfc3339()),
-        provider: Some("Talka Cap Pro".to_string()),
+        provider: Some("Talka Recall".to_string()),
         webcam_primary_user: None,
         is_private: Some(false),
         speakers: vec![],
@@ -290,7 +304,9 @@ pub async fn upload_recording(
     create_call_metadata(access_token, &create_response.file_id, metadata).await?;
     
     if let Some(ref cb) = status_callback {
-        cb(UploadStatus::Complete);
+        cb(UploadStatus::Complete { 
+            file_id: create_response.file_id.clone() 
+        });
     }
     
     Ok(create_response.file_id)

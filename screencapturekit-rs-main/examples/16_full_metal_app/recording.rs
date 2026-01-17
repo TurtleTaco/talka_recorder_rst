@@ -179,7 +179,7 @@ impl RecordingState {
 
             if std::path::Path::new(p).exists() {
                 println!("✅ Recording saved: {p}");
-                let _ = std::process::Command::new("open").arg(p).spawn();
+                // Note: File is NOT automatically opened - UI handles the flow
             } else {
                 println!("⚠️  Recording file not found: {p}");
             }
@@ -230,7 +230,9 @@ impl RecordingState {
             {
                 Ok(file_id) => {
                     println!("✅ Upload complete! File ID: {}", file_id);
-                    *upload_status.lock().unwrap() = UploadStatus::Complete;
+                    *upload_status.lock().unwrap() = UploadStatus::Complete { 
+                        file_id: file_id.clone() 
+                    };
                 }
                 Err(e) => {
                     eprintln!("❌ Upload failed: {}", e);

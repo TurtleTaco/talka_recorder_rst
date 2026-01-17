@@ -268,7 +268,7 @@ impl VertexBufferBuilder {
             };
             (display, NEON_CYAN)
         } else {
-            ("Talka Cap Pro".to_string(), [0.5, 0.4, 0.6, 1.0])
+            ("Talka Recall".to_string(), [0.5, 0.4, 0.6, 1.0])
         };
 
         let title_scale = scale * 1.4;
@@ -533,7 +533,7 @@ impl VertexBufferBuilder {
         let text_x = 12.0f32.mul_add(base_scale, x + padding);
 
         // Title
-        self.text(font, "RECORDING", text_x - 4.0, ly, scale * 0.9, NEON_PINK);
+        self.text(font, "SOURCE", text_x - 4.0, ly, scale * 0.9, NEON_PINK);
         ly += line_h * 1.2;
 
         // Separator line
@@ -625,7 +625,7 @@ impl VertexBufferBuilder {
             UploadStatus::CreatingFile | UploadStatus::UploadingFile { .. } | UploadStatus::CreatingMetadata => {
                 (NEON_CYAN, [0.04, 0.08, 0.1, 0.95])
             }
-            UploadStatus::Complete => ([0.3, 1.0, 0.5, 1.0], [0.04, 0.1, 0.06, 0.95]),
+            UploadStatus::Complete { .. } => ([0.3, 1.0, 0.5, 1.0], [0.04, 0.1, 0.06, 0.95]),
             UploadStatus::Failed(_) => ([1.0, 0.3, 0.3, 1.0], [0.1, 0.02, 0.02, 0.95]),
         };
 
@@ -646,10 +646,10 @@ impl VertexBufferBuilder {
         // Icon
         let icon = match upload_status {
             UploadStatus::CreatingFile | UploadStatus::UploadingFile { .. } | UploadStatus::CreatingMetadata => {
-                "↑"
+                ""
             }
-            UploadStatus::Complete => "✓",
-            UploadStatus::Failed(_) => "✗",
+            UploadStatus::Complete { .. } => "",
+            UploadStatus::Failed(_) => "",
             UploadStatus::Idle => "",
         };
 

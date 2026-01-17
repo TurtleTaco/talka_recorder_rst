@@ -7,6 +7,7 @@ pub enum CaptureCommand {
     TakeScreenshot,
     StartRecording,
     StopRecording,
+    CancelRecording,
     SelectSource,
     ToggleMicrophone,
     Quit,

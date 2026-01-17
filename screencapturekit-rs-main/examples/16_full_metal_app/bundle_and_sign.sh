@@ -7,7 +7,8 @@
 
 set -e
 
-APP_NAME="TalkaCapturePro"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_NAME="TalkaRecall"
 VERSION="1.0.0"
 BINARY_NAME="16_full_metal_app"
 
@@ -81,7 +82,7 @@ echo "📝 Updating Info.plist..."
 # Update bundle metadata
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${APP_NAME}" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleName ${APP_NAME}" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ai.talka.capturepro" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ai.talka.recall" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null
 
 # Remove incompatible legacy flags that cause "not compatible" errors
@@ -109,6 +110,23 @@ echo "🔧 Removing legacy compatibility flags..."
 
 echo "✅ Info.plist updated"
 
+# Copy app icon if it exists
+ICON_FILE="${SCRIPT_DIR}/assets/talka_logo.icns"
+if [[ -f "${ICON_FILE}" ]]; then
+    echo ""
+    echo "🎨 Adding app icon..."
+    mkdir -p "${BUNDLE_PATH}/Contents/Resources"
+    cp "${ICON_FILE}" "${BUNDLE_PATH}/Contents/Resources/${APP_NAME}.icns"
+    # Update Info.plist to reference the icon
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string '${APP_NAME}.icns'" "${BUNDLE_PATH}/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile '${APP_NAME}.icns'" "${BUNDLE_PATH}/Contents/Info.plist"
+    echo "✅ App icon added"
+else
+    echo ""
+    echo "⚠️  Warning: Icon file not found at ${ICON_FILE}"
+    echo "   Run ./create_icon.sh to generate the icon from SVG"
+fi
+
 # Optional: Code sign the binary
 echo ""
 CODE_SIGNED=false
@@ -130,20 +148,31 @@ if [[ -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" && -n "${TEAM_ID}" ]]; then
     else
         echo "🔐 Signing with identity: ${IDENTITY}"
         
+        # Path to entitlements file
+        ENTITLEMENTS_FILE="${SCRIPT_DIR}/TalkaRecall.entitlements"
+        
+        if [[ ! -f "${ENTITLEMENTS_FILE}" ]]; then
+            echo "❌ Error: Entitlements file not found at ${ENTITLEMENTS_FILE}"
+            echo "   Entitlements are required for screen recording and audio permissions"
+            exit 1
+        fi
+        
         # Sign the binary first with the correct identifier
-        echo "  📝 Signing binary with identifier: ai.talka.capturepro..."
+        echo "  📝 Signing binary with identifier: ai.talka.recall..."
         codesign --force --sign "${IDENTITY}" \
-            --identifier "ai.talka.capturepro" \
+            --identifier "ai.talka.recall" \
             --options runtime \
             --timestamp \
+            --entitlements "${ENTITLEMENTS_FILE}" \
             "${BUNDLE_PATH}/Contents/MacOS/${BINARY_NAME}"
         
         # Then sign the entire .app bundle
-        echo "  📝 Signing app bundle..."
+        echo "  📝 Signing app bundle with entitlements..."
         codesign --force --sign "${IDENTITY}" \
-            --identifier "ai.talka.capturepro" \
+            --identifier "ai.talka.recall" \
             --options runtime \
             --timestamp \
+            --entitlements "${ENTITLEMENTS_FILE}" \
             "${BUNDLE_PATH}"
         echo "✅ App bundle signed successfully"
         
@@ -163,20 +192,31 @@ else
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         read -p "Enter your Developer ID Application identity: " IDENTITY
         
+        # Path to entitlements file
+        ENTITLEMENTS_FILE="${SCRIPT_DIR}/TalkaRecall.entitlements"
+        
+        if [[ ! -f "${ENTITLEMENTS_FILE}" ]]; then
+            echo "❌ Error: Entitlements file not found at ${ENTITLEMENTS_FILE}"
+            echo "   Entitlements are required for screen recording and audio permissions"
+            exit 1
+        fi
+        
         # Sign the binary first with the correct identifier
-        echo "  📝 Signing binary with identifier: ai.talka.capturepro..."
+        echo "  📝 Signing binary with identifier: ai.talka.recall..."
         codesign --force --sign "${IDENTITY}" \
-            --identifier "ai.talka.capturepro" \
+            --identifier "ai.talka.recall" \
             --options runtime \
             --timestamp \
+            --entitlements "${ENTITLEMENTS_FILE}" \
             "${BUNDLE_PATH}/Contents/MacOS/${BINARY_NAME}"
         
         # Then sign the entire .app bundle
-        echo "  📝 Signing app bundle..."
+        echo "  📝 Signing app bundle with entitlements..."
         codesign --force --sign "${IDENTITY}" \
-            --identifier "ai.talka.capturepro" \
+            --identifier "ai.talka.recall" \
             --options runtime \
             --timestamp \
+            --entitlements "${ENTITLEMENTS_FILE}" \
             "${BUNDLE_PATH}"
         echo "✅ App bundle signed with: ${IDENTITY}"
         
@@ -193,6 +233,7 @@ else
 fi
 
 # Optional: Notarize the binary
+NOTARIZED=false
 if [[ -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" && -n "${TEAM_ID}" ]]; then
     echo ""
     
@@ -225,6 +266,7 @@ if [[ -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" && -n "${TEAM_ID}" ]]; then
         # Check if notarization was accepted
         if echo "${NOTARIZE_OUTPUT}" | grep -q "status: Accepted"; then
             echo "✅ Notarization successful!"
+            NOTARIZED=true
             
             # Staple the notarization ticket to the .app bundle
             echo "📎 Stapling notarization ticket to app bundle..."
@@ -321,18 +363,31 @@ echo "  - README.txt"
 echo ""
 
 if [[ "${CODE_SIGNED}" == "true" ]]; then
-    echo "🚀 You can now distribute dist/${APP_NAME}-${VERSION}.zip to users"
-    echo ""
-    echo "✅ App is properly signed and notarized for distribution"
-    echo ""
-    echo "Users can:"
-    echo "  1. Download and unzip the package"
-    echo "  2. Drag ${APP_NAME}.app to their Applications folder"
-    echo "  3. Double-click to launch"
-    echo ""
-    echo "⚠️  Note: On first launch, users may need to:"
-    echo "    - Right-click the app and select 'Open' (first time only)"
-    echo "    - Or go to System Settings → Privacy & Security → 'Open Anyway'"
+    if [[ "${NOTARIZED}" == "true" ]]; then
+        echo "🚀 You can now distribute dist/${APP_NAME}-${VERSION}.zip to users"
+        echo ""
+        echo "✅ App is properly signed AND notarized for distribution"
+        echo ""
+        echo "Users can:"
+        echo "  1. Download and unzip the package"
+        echo "  2. Drag ${APP_NAME}.app to their Applications folder"
+        echo "  3. Double-click to launch (no warnings!)"
+    else
+        echo "⚠️  App is SIGNED but NOT NOTARIZED"
+        echo ""
+        echo "❌ This app will show 'malware' warnings on other Macs!"
+        echo ""
+        echo "To properly distribute, you need to notarize. Set these environment variables:"
+        echo "  export APPLE_ID='your-apple-id@example.com'"
+        echo "  export APPLE_PASSWORD='app-specific-password'"
+        echo "  export TEAM_ID='YOUR_TEAM_ID'"
+        echo ""
+        echo "Then re-run: ./bundle_and_sign.sh"
+        echo ""
+        echo "For LOCAL/TESTING ONLY, users can bypass with:"
+        echo "  xattr -cr ${APP_NAME}.app"
+        echo "  (or right-click → Open)"
+    fi
 else
     echo "⚠️  LOCAL USE ONLY - NOT FOR DISTRIBUTION"
     echo ""

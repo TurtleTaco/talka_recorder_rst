@@ -2,24 +2,24 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Screen Recording Access -->
-    <key>com.apple.security.device.camera</key>
-    <true/>
-    
-    <!-- Audio Recording Access -->
+    <!-- Audio Recording Access (for microphone capture) -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
     
-    <!-- Allow JIT compilation (for performance) -->
+    <!-- Allow JIT compilation (required for Rust/Metal performance) -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
     
-    <!-- Allow unsigned executable memory (may be needed for some operations) -->
+    <!-- Allow unsigned executable memory (required for JIT) -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     
-    <!-- Disable library validation (allows loading of unsigned libraries) -->
+    <!-- Disable library validation (allows dynamic linking) -->
     <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    
+    <!-- Allow DYLD environment variables (for development/debugging) -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
     <true/>
 </dict>
 </plist>
