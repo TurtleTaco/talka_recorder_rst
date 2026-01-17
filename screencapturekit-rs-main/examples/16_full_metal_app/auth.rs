@@ -409,6 +409,81 @@ pub fn logout() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Meeting event information from the calendar API
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeetingEvent {
+    pub bot_meeting_id: String,
+    pub event_id: String,
+    pub event_status: String,
+    pub event_summary: String,
+    pub join: bool,
+    pub join_toggle: Option<bool>,
+    pub meeting_participants: Vec<String>,
+    pub meeting_start_time: String, // ISO 8601 format: "2026-01-19T14:30:00"
+    pub meeting_url: String,
+    pub platform: String,
+    pub user_id: String,
+}
+
+impl MeetingEvent {
+    /// Parse the meeting start time and format it for display
+    /// Returns formatted string like "19 Jan, MON 9:30 AM"
+    pub fn formatted_start_time(&self) -> String {
+        use chrono::{DateTime, Local};
+        
+        // Parse the ISO 8601 timestamp
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&self.meeting_start_time) {
+            // Convert to local timezone
+            let local_dt: DateTime<Local> = dt.with_timezone(&Local);
+            
+            // Format: "19 Jan, MON 9:30 AM"
+            local_dt.format("%d %b, %a %I:%M %p").to_string().to_uppercase()
+        } else {
+            // Fallback if parsing fails
+            self.meeting_start_time.clone()
+        }
+    }
+}
+
+/// Fetch meeting events from the Talka backend
+pub async fn get_meeting_events(access_token: &str) -> Result<Vec<MeetingEvent>, AuthError> {
+    let client = reqwest::Client::new();
+    let url = "https://meeting-bot-scheduler.talka.ai/meeting-events";
+
+    let response = client
+        .get(url)
+        .header("authorization", access_token)
+        .send()
+        .await
+        .map_err(|e| AuthError::NetworkError(e.to_string()))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(AuthError::NetworkError(format!(
+            "Failed to fetch meeting events: HTTP {}: {}",
+            status, text
+        )));
+    }
+
+    let response_text = response.text().await
+        .map_err(|e| AuthError::NetworkError(format!("Failed to read response: {}", e)))?;
+
+    let mut events: Vec<MeetingEvent> = serde_json::from_str(&response_text)
+        .map_err(|e| AuthError::NetworkError(format!("Failed to parse meeting events: {}", e)))?;
+    
+    // Sort by meeting_start_time (earliest to latest)
+    events.sort_by(|a, b| a.meeting_start_time.cmp(&b.meeting_start_time));
+    
+    println!("Meeting events API response: {} events returned", events.len());
+    for event in &events {
+        println!("  - {} at {}", event.event_summary, event.formatted_start_time());
+    }
+    
+    Ok(events)
+}
+
 /// Get valid tokens - either from cache or by authenticating
 ///
 /// This function:

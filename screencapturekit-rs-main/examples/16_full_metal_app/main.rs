@@ -93,6 +93,9 @@ fn run_app() {
     
     // Shared auth tokens for upload
     let auth_tokens_shared: Arc<Mutex<Option<auth::AuthTokens>>> = Arc::new(Mutex::new(None));
+    
+    // Shared meeting events
+    let meeting_events_shared: Arc<Mutex<Vec<auth::MeetingEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Start authentication in background
     let auth_state_clone = Arc::clone(&auth_state_shared);
@@ -122,6 +125,7 @@ fn run_app() {
     let uploaded_file_id_clone = Arc::clone(&uploaded_file_id);
     let capture_state_backend = Arc::clone(&capture_state);
     let auth_tokens_backend = Arc::clone(&auth_tokens_shared);
+    let runtime_handle_capture = runtime_handle.clone();
     
     thread::spawn(move || {
         run_capture_backend(
@@ -131,7 +135,7 @@ fn run_app() {
             source_name_clone,
             upload_status_clone,
             uploaded_file_id_clone,
-            runtime_handle,
+            runtime_handle_capture,
             capture_state_backend,
             auth_tokens_backend,
         );
@@ -143,11 +147,60 @@ fn run_app() {
         GLOBAL_IS_CAPTURING = Some(is_capturing);
         GLOBAL_IS_RECORDING = Some(is_recording);
         GLOBAL_SOURCE_NAME = Some(source_name);
-        GLOBAL_AUTH_STATE = Some(auth_state_shared);
+        GLOBAL_AUTH_STATE = Some(auth_state_shared.clone());
         GLOBAL_UPLOAD_STATUS = Some(upload_status_str);
         GLOBAL_UPLOADED_FILE_ID = Some(uploaded_file_id);
         GLOBAL_CAPTURE_STATE = Some(capture_state);
+        GLOBAL_MEETING_EVENTS = Some(meeting_events_shared.clone());
+        GLOBAL_AUTH_TOKENS = Some(auth_tokens_shared.clone());
     }
+    
+    // Start meeting events fetching in background
+    let meeting_events_clone = Arc::clone(&meeting_events_shared);
+    let auth_tokens_fetch = Arc::clone(&auth_tokens_shared);
+    let runtime_handle_events = runtime_handle.clone();
+    
+    // Initial fetch on startup (try immediately after auth)
+    let meeting_events_initial = Arc::clone(&meeting_events_shared);
+    let auth_tokens_initial = Arc::clone(&auth_tokens_shared);
+    runtime_handle.spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
+        let access_token = {
+            let guard = auth_tokens_initial.lock().unwrap();
+            guard.as_ref().map(|t| t.access_token.clone())
+        };
+        
+        if let Some(token) = access_token {
+            match auth::get_meeting_events(&token).await {
+                Ok(events) => {
+                    *meeting_events_initial.lock().unwrap() = events;
+                }
+                Err(_) => {}
+            }
+        }
+    });
+    
+    // Periodic refresh every 5 minutes
+    runtime_handle_events.spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+            
+            let access_token = {
+                let guard = auth_tokens_fetch.lock().unwrap();
+                guard.as_ref().map(|t| t.access_token.clone())
+            };
+            
+            if let Some(token) = access_token {
+                match auth::get_meeting_events(&token).await {
+                    Ok(events) => {
+                        *meeting_events_clone.lock().unwrap() = events;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    });
 
     // Launch Dioxus UI with custom window config
     let config = Config::new()
@@ -170,6 +223,8 @@ static mut GLOBAL_AUTH_STATE: Option<Arc<Mutex<AuthState>>> = None;
 static mut GLOBAL_UPLOAD_STATUS: Option<Arc<Mutex<String>>> = None;
 static mut GLOBAL_UPLOADED_FILE_ID: Option<Arc<Mutex<String>>> = None;
 static mut GLOBAL_CAPTURE_STATE: Option<Arc<CaptureState>> = None;
+static mut GLOBAL_MEETING_EVENTS: Option<Arc<Mutex<Vec<auth::MeetingEvent>>>> = None;
+static mut GLOBAL_AUTH_TOKENS: Option<Arc<Mutex<Option<auth::AuthTokens>>>> = None;
 
 fn get_global_state() -> (
     Option<Sender<CaptureCommand>>,
@@ -180,6 +235,8 @@ fn get_global_state() -> (
     Arc<Mutex<String>>,
     Arc<Mutex<String>>,
     Arc<CaptureState>,
+    Arc<Mutex<Vec<auth::MeetingEvent>>>,
+    Arc<Mutex<Option<auth::AuthTokens>>>,
 ) {
     unsafe {
         (
@@ -191,12 +248,14 @@ fn get_global_state() -> (
             GLOBAL_UPLOAD_STATUS.clone().unwrap(),
             GLOBAL_UPLOADED_FILE_ID.clone().unwrap(),
             GLOBAL_CAPTURE_STATE.clone().unwrap(),
+            GLOBAL_MEETING_EVENTS.clone().unwrap(),
+            GLOBAL_AUTH_TOKENS.clone().unwrap(),
         )
     }
 }
 
 fn app_with_backend() -> Element {
-    let (_cmd_tx, is_capturing, is_recording, source_name, auth_state, upload_status, uploaded_file_id, _capture_state) = get_global_state();
+    let (_cmd_tx, is_capturing, is_recording, source_name, auth_state, upload_status, uploaded_file_id, _capture_state, meeting_events, auth_tokens) = get_global_state();
 
     let mut is_capturing_sig = use_signal(|| is_capturing.load(Ordering::Relaxed));
     let mut is_recording_sig = use_signal(|| is_recording.load(Ordering::Relaxed));
@@ -208,12 +267,14 @@ fn app_with_backend() -> Element {
     let mut capture_info_sig = use_signal(|| String::from(""));
     let mut recording_duration_sig = use_signal(|| String::from(""));
     let mut recording_start_time_sig = use_signal(|| None::<std::time::Instant>);
+    let mut meeting_events_sig = use_signal(|| meeting_events.lock().unwrap().clone());
+    let mut show_calendar_view = use_signal(|| false);
 
     // Poll for updates every 100ms
     use_future(move || async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            let (_, is_cap, is_rec, src_name, auth, upl, file_id, cap_state) = get_global_state();
+            let (_, is_cap, is_rec, src_name, auth, upl, file_id, cap_state, mtg_events, _) = get_global_state();
             let was_recording = *is_recording_sig.read();
             let is_recording_now = is_rec.load(Ordering::Relaxed);
             
@@ -223,6 +284,7 @@ fn app_with_backend() -> Element {
             auth_state_sig.set(auth.lock().unwrap().clone());
             upload_status_sig.set(upl.lock().unwrap().clone());
             uploaded_file_id_sig.set(file_id.lock().unwrap().clone());
+            meeting_events_sig.set(mtg_events.lock().unwrap().clone());
             
             // Track recording start time
             if is_recording_now && !was_recording {
@@ -276,16 +338,60 @@ fn app_with_backend() -> Element {
                 // Header with logo and profile
                 Header { 
                     auth_state: auth_state_sig.read().clone(),
+                    show_calendar_view: *show_calendar_view.read(),
+                    on_calendar_click: move |_| {
+                        let current = *show_calendar_view.read();
+                        show_calendar_view.set(!current);
+                        
+                        // Refresh meeting events when calendar is opened
+                        if !current {
+                            let (_, _, _, _, _, _, _, _, mtg_events, auth_tkns) = get_global_state();
+                            
+                            let events_clone = Arc::clone(&mtg_events);
+                            let tokens_clone = Arc::clone(&auth_tkns);
+                            
+                            tokio::spawn(async move {
+                                let access_token = {
+                                    let guard = tokens_clone.lock().unwrap();
+                                    guard.as_ref().map(|t| t.access_token.clone())
+                                };
+                                
+                                if let Some(token) = access_token {
+                                    match auth::get_meeting_events(&token).await {
+                                        Ok(events) => {
+                                            *events_clone.lock().unwrap() = events;
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
+                            });
+                        }
+                    },
                 }
                 
-                // Main content area - centered
-                MainContent { 
-                    is_capturing: *is_capturing_sig.read(),
-                    is_recording: *is_recording_sig.read(),
-                    source_name: source_name_sig.read().clone(),
-                    recording_duration: recording_duration_sig.read().clone(),
-                    upload_status: upload_status_sig.read().clone(),
-                    uploaded_file_id: uploaded_file_id_sig.read().clone(),
+                // Calendar events view (full overlay)
+                if *show_calendar_view.read() {
+                    CalendarEventsView {
+                        events: meeting_events_sig.read().clone(),
+                        on_close: move |_| {
+                            show_calendar_view.set(false);
+                        },
+                    }
+                } else {
+                    // Next meeting notification bar (when calendar is closed)
+                    NextMeetingNotification {
+                        events: meeting_events_sig.read().clone(),
+                    }
+                    
+                    // Main content area - centered
+                    MainContent { 
+                        is_capturing: *is_capturing_sig.read(),
+                        is_recording: *is_recording_sig.read(),
+                        source_name: source_name_sig.read().clone(),
+                        recording_duration: recording_duration_sig.read().clone(),
+                        upload_status: upload_status_sig.read().clone(),
+                        uploaded_file_id: uploaded_file_id_sig.read().clone(),
+                    }
                 }
             }
         }
@@ -378,7 +484,7 @@ fn LoginOverlay(auth_state: AuthState) -> Element {
 }
 
 #[component]
-fn Header(auth_state: AuthState) -> Element {
+fn Header(auth_state: AuthState, show_calendar_view: bool, on_calendar_click: EventHandler<()>) -> Element {
     const LOGO_SVG: &str = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzkxIiBoZWlnaHQ9IjE2OCIgdmlld0JveD0iMCAwIDM5MSAxNjgiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxyZWN0IHg9IjI0IiB5PSI1MiIgd2lkdGg9IjI0IiBoZWlnaHQ9IjY0IiByeD0iMTIiIGZpbGw9IiM2NDhGRkYiLz4KPHJlY3QgeD0iNTYiIHk9IjM0IiB3aWR0aD0iMjQiIGhlaWdodD0iMTAwIiByeD0iMTIiIGZpbGw9IiMyNkM0ODUiLz4KPHJlY3QgeD0iODgiIHk9IjUyIiB3aWR0aD0iMjQiIGhlaWdodD0iNjQiIHJ4PSIxMiIgZmlsbD0iI0UwMUU1QSIvPgo8cmVjdCB4PSIxMjAiIHk9IjY4IiB3aWR0aD0iMjQiIGhlaWdodD0iMzIiIHJ4PSIxMiIgZmlsbD0iI0Y2QUUyRCIvPgo8cGF0aCBkPSJNMjA3LjA0IDc0LjE2VjEwMEMyMDcuMDQgMTAyLjEzMyAyMDcuNDkzIDEwMy42NTMgMjA4LjQgMTA0LjU2QzIwOS4zMDcgMTA1LjQxMyAyMTAuODggMTA1Ljg0IDIxMy4xMiAxMDUuODRIMjE4LjQ4VjExMkgyMTEuOTJDMjA3Ljg2NyAxMTIgMjA0LjgyNyAxMTEuMDY3IDIwMi44IDEwOS4yQzIwMC43NzMgMTA3LjMzMyAxOTkuNzYgMTA0LjI2NyAxOTkuNzYgMTAwVjc0LjE2SDE5NC4wOFY2OC4xNkgxOTkuNzZWNTcuMTJIMjA3LjA0VjY4LjE2SDIxOC40OFY3NC4xNkgyMDcuMDRaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMjI0LjU4MSA4OS45MkMyMjQuNTgxIDg1LjQ0IDIyNS40ODcgODEuNTIgMjI3LjMwMSA3OC4xNkMyMjkuMTE0IDc0Ljc0NjcgMjMxLjU5NCA3Mi4xMDY3IDIzNC43NDEgNzAuMjRDMjM3Ljk0MSA2OC4zNzMzIDI0MS40ODcgNjcuNDQgMjQ1LjM4MSA2Ny40NEMyNDkuMjIxIDY3LjQ0IDI1Mi41NTQgNjguMjY2NyAyNTUuMzgxIDY5LjkyQzI1OC4yMDcgNzEuNTczMyAyNjAuMzE0IDczLjY1MzMgMjYxLjcwMSA3Ni4xNlY2OC4xNkgyNjkuMDYxVjExMkgyNjEuNzAxVjEwMy44NEMyNjAuMjYxIDEwNi40IDI1OC4xMDEgMTA4LjUzMyAyNTUuMjIxIDExMC4yNEMyNTIuMzk0IDExMS44OTMgMjQ5LjA4NyAxMTIuNzIgMjQ1LjMwMSAxMTIuNzJDMjQxLjQwNyAxMTIuNzIgMjM3Ljg4NyAxMTEuNzYgMjM0Ljc0MSAxMDkuODRDMjMxLjU5NCAxMDcuOTIgMjI5LjExNCAxMDUuMjI3IDIyNy4zMDEgMTAxLjc2QzIyNS40ODcgOTguMjkzMyAyMjQuNTgxIDk0LjM0NjcgMjI0LjU4MSA4OS45MlpNMjYxLjcwMSA5MEMyNjEuNzAxIDg2LjY5MzMgMjYxLjAzNCA4My44MTMzIDI1OS43MDEgODEuMzZDMjU4LjM2NyA3OC45MDY3IDI1Ni41NTQgNzcuMDQgMjU0LjI2MSA3NS43NkMyNTIuMDIxIDc0LjQyNjcgMjQ5LjU0MSA3My43NiAyNDYuODIxIDczLjc2QzI0NC4xMDEgNzMuNzYgMjQxLjYyMSA3NC40IDIzOS4zODEgNzUuNjhDMjM3LjE0MSA3Ni45NiAyMzUuMzU0IDc4LjgyNjcgMjM0LjAyMSA4MS4yOEMyMzIuNjg3IDgzLjczMzMgMjMyLjAyMSA4Ni42MTMzIDIzMi4wMjEgODkuOTJDMjMyLjAyMSA5My4yOCAyMzIuNjg3IDk2LjIxMzMgMjM0LjAyMSA5OC43MkMyMzUuMzU0IDEwMS4xNzMgMjM3LjE0MSAxMDMuMDY3IDIzOS4zODEgMTA0LjRDMjQxLjYyMSAxMDUuNjggMjQ0LjEwMSAxMDYuMzIgMjQ2LjgyMSAxMDYuMzJDMjQ5LjU0MSAxMDYuMzIgMjUyLjAyMSAxMDUuNjggMjU0LjI2MSAxMDQuNEMyNTYuNTU0IDEwMy4wNjcgMjU4LjM2NyAxMDEuMTczIDI1OS43MDEgOTguNzJDMjYxLjAzNCA5Ni4yMTMzIDI2MS43MDEgOTMuMzA2NyAyNjEuNzAxIDkwWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTI4OC42NDMgNTIuOFYxMTJIMjgxLjM2M1Y1Mi44SDI4OC42NDNaIiBmaWxsPSJibGFjayIvPgo8cGF0aCBkPSJNMzI1LjUzMSAxMTJMMzA4LjMzMSA5Mi42NFYxMTJIMzAxLjA1MVY1Mi44SDMwOC4zMzFWODcuNkwzMjUuMjExIDY4LjE2SDMzNS4zNzFMMzE0LjczMSA5MEwzMzUuNDUxIDExMkgzMjUuNTMxWiIgZmlsbD0iYmxhY2siLz4KPHBhdGggZD0iTTMzOS41MDMgODkuOTJDMzM5LjUwMyA4NS40NCAzNDAuNDA5IDgxLjUyIDM0Mi4yMjMgNzguMTZDMzQ0LjAzNiA3NC43NDY3IDM0Ni41MTYgNzIuMTA2NyAzNDkuNjYzIDcwLjI0QzM1Mi44NjMgNjguMzczMyAzNTYuNDA5IDY3LjQ0IDM2MC4zMDMgNjcuNDRDMzY0LjE0MyA2Ny40NCAzNjcuNDc2IDY4LjI2NjcgMzcwLjMwMyA2OS45MkMzNzMuMTI5IDcxLjU3MzMgMzc1LjIzNiA3My42NTMzIDM3Ni42MjMgNzYuMTZWNjguMTZIMzgzLjk4M1YxMTJIMzc2LjYyM1YxMDMuODRDMzc1LjE4MyAxMDYuNCAzNzMuMDIzIDEwOC41MzMgMzcwLjE0MyAxMTAuMjRDMzY3LjMxNiAxMTEuODkzIDM2NC4wMDkgMTEyLjcyIDM2MC4yMjMgMTEyLjcyQzM1Ni4zMjkgMTEyLjcyIDM1Mi44MDkgMTExLjc2IDM0OS42NjMgMTA5Ljg0QzM0Ni41MTYgMTA3LjkyIDM0NC4wMzYgMTA1LjIyNyAzNDIuMjIzIDEwMS43NkMzNDAuNDA5IDk4LjI5MzMgMzM5LjUwMyA5NC4zNDY3IDMzOS41MDMgODkuOTJaTTM3Ni42MjMgOTBDMzc2LjYyMyA4Ni42OTMzIDM3NS45NTYgODMuODEzMyAzNzQuNjIzIDgxLjM2QzM3My4yODkgNzguOTA2NyAzNzEuNDc2IDc3LjA0IDM2OS4xODMgNzUuNzZDMzY2Ljk0MyA3NC40MjY3IDM2NC40NjMgNzMuNzYgMzYxLjc0MyA3My43NkMzNTkuMDIzIDczLjc2IDM1Ni41NDMgNzQuNCAzNTQuMzAzIDc1LjY4QzM1Mi4wNjMgNzYuOTYgMzUwLjI3NiA3OC44MjY3IDM0OC45NDMgODEuMjhDMzQ3LjYwOSA4My43MzMzIDM0Ni45NDMgODYuNjEzMyAzNDYuOTQzIDg5LjkyQzM0Ni45NDMgOTMuMjggMzQ3LjYwOSA5Ni4yMTMzIDM0OC45NDMgOTguNzJDMzUwLjI3NiAxMDEuMTczIDM1Mi4wNjMgMTAzLjA2NyAzNTQuMzAzIDEwNC40QzM1Ni41NDMgMTA1LjY4IDM1OS4wMjMgMTA2LjMyIDM2MS43NDMgMTA2LjMyQzM2NC40NjMgMTA2LjMyIDM2Ni45NDMgMTA1LjY4IDM2OS4xODMgMTA0LjRDMzcxLjQ3NiAxMDMuMDY3IDM3My4yODkgMTAxLjE3MyAzNzQuNjIzIDk4LjcyQzM3NS45NTYgOTYuMjEzMyAzNzYuNjIzIDkzLjMwNjcgMzc2LjYyMyA5MFoiIGZpbGw9ImJsYWNrIi8+Cjwvc3ZnPgo=";
     
     let profile = match auth_state {
@@ -398,6 +504,14 @@ fn Header(auth_state: AuthState) -> Element {
             }
             
             div { class: "header-actions",
+                // Calendar icon button
+                button {
+                    class: if show_calendar_view { "calendar-button active" } else { "calendar-button" },
+                    onclick: move |_| on_calendar_click.call(()),
+                    title: "View Calendar Events",
+                    dangerous_inner_html: r#"<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="4" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M3 8h14" stroke="currentColor" stroke-width="1.5"/><path d="M7 2v3M13 2v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>"#
+                }
+                
                 if let Some(ref p) = profile {
                     div { 
                         class: "user-profile-container",
@@ -437,6 +551,142 @@ fn Header(auth_state: AuthState) -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn CalendarEventsView(events: Vec<auth::MeetingEvent>, on_close: EventHandler<()>) -> Element {
+    let mut current_page = use_signal(|| 0);
+    
+    const EVENTS_PER_PAGE: usize = 10;
+    let total_pages = (events.len() + EVENTS_PER_PAGE - 1) / EVENTS_PER_PAGE;
+    let current_page_num = *current_page.read();
+    
+    let start_idx = current_page_num * EVENTS_PER_PAGE;
+    let end_idx = (start_idx + EVENTS_PER_PAGE).min(events.len());
+    let page_events: Vec<_> = events.iter().skip(start_idx).take(end_idx - start_idx).collect();
+    
+    let subtitle = if events.is_empty() {
+        "No meetings scheduled".to_string()
+    } else if total_pages > 1 {
+        format!("Page {} of {}", current_page_num + 1, total_pages)
+    } else {
+        format!("{} meeting{}", events.len(), if events.len() == 1 { "" } else { "s" })
+    };
+    
+    rsx! {
+        div { class: "calendar-overlay",
+            div { class: "calendar-container",
+                div { class: "calendar-header",
+                    div { class: "calendar-header-content",
+                        h2 { class: "calendar-title", "Upcoming Meetings" }
+                        p { class: "calendar-subtitle", "{subtitle}" }
+                    }
+                    button {
+                        class: "calendar-close-btn",
+                        onclick: move |_| on_close.call(()),
+                        dangerous_inner_html: r#"<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>"#
+                    }
+                }
+                
+                div { class: "calendar-content",
+                    if events.is_empty() {
+                        div { class: "no-events",
+                            div { class: "no-events-icon",
+                                dangerous_inner_html: r#"<svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="8" y="12" width="32" height="28" rx="3" stroke="currentColor" stroke-width="2" fill="none"/><path d="M8 18h32" stroke="currentColor" stroke-width="2"/><path d="M16 8v6M32 8v6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="26" r="1.5" fill="currentColor"/><circle cx="24" cy="26" r="1.5" fill="currentColor"/><circle cx="32" cy="26" r="1.5" fill="currentColor"/></svg>"#
+                            }
+                            div { class: "no-events-text", "No upcoming meetings scheduled" }
+                        }
+                    } else {
+                        for event in page_events.iter() {
+                            div { class: "meeting-card",
+                                div { class: "meeting-card-left",
+                                    div { class: "meeting-time",
+                                        "{event.formatted_start_time()}"
+                                    }
+                                    div { class: "meeting-title",
+                                        "{event.event_summary}"
+                                    }
+                                }
+                                button {
+                                    class: "meeting-join-btn",
+                                    onclick: {
+                                        let url = event.meeting_url.clone();
+                                        move |_| {
+                                            let _ = std::process::Command::new("open").arg(&url).spawn();
+                                        }
+                                    },
+                                    title: "Open meeting link",
+                                    dangerous_inner_html: r#"<svg width="18" height="18" viewBox="0 0 64 64" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M36.026,20.058l-21.092,0c-1.65,0 -2.989,1.339 -2.989,2.989l0,25.964c0,1.65 1.339,2.989 2.989,2.989l26.024,0c1.65,0 2.989,-1.339 2.989,-2.989l0,-20.953l3.999,0l0,21.948c0,3.308 -2.686,5.994 -5.995,5.995l-28.01,0c-3.309,0 -5.995,-2.687 -5.995,-5.995l0,-27.954c0,-3.309 2.686,-5.995 5.995,-5.995l22.085,0l0,4.001Z"/><path d="M55.925,25.32l-4.005,0l0,-10.481l-27.894,27.893l-2.832,-2.832l27.895,-27.895l-10.484,0l0,-4.005l17.318,0l0.002,0.001l0,17.319Z"/></svg>"#
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if total_pages > 1 {
+                    div { class: "calendar-pagination",
+                        button {
+                            class: "pagination-btn",
+                            disabled: current_page_num == 0,
+                            onclick: move |_| {
+                                if current_page_num > 0 {
+                                    current_page.set(current_page_num - 1);
+                                }
+                            },
+                            dangerous_inner_html: r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M10 12L6 8l4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#
+                        }
+                        
+                        div { class: "pagination-info",
+                            "Page {current_page_num + 1} of {total_pages}"
+                        }
+                        
+                        button {
+                            class: "pagination-btn",
+                            disabled: current_page_num >= total_pages - 1,
+                            onclick: move |_| {
+                                if current_page_num < total_pages - 1 {
+                                    current_page.set(current_page_num + 1);
+                                }
+                            },
+                            dangerous_inner_html: r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 12l4-4-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>"#
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn NextMeetingNotification(events: Vec<auth::MeetingEvent>) -> Element {
+    use chrono::{DateTime, Utc, Duration as ChronoDuration};
+    
+    // Find the next upcoming meeting (within next 24 hours)
+    let now = Utc::now();
+    let next_24_hours = now + ChronoDuration::hours(24);
+    
+    let next_meeting = events.iter().find(|event| {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&event.meeting_start_time) {
+            let event_time = dt.with_timezone(&Utc);
+            event_time > now && event_time < next_24_hours
+        } else {
+            false
+        }
+    });
+    
+    if let Some(meeting) = next_meeting {
+        rsx! {
+            div { class: "next-meeting-bar",
+                div { class: "next-meeting-content",
+                    span { class: "next-meeting-label", "Next Meeting:" }
+                    span { class: "next-meeting-time", "{meeting.formatted_start_time()}" }
+                    span { class: "next-meeting-title", "- {meeting.event_summary}" }
+                }
+            }
+        }
+    } else {
+        rsx! { div {} }
     }
 }
 
@@ -485,7 +735,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                         button {
                             class: "btn btn-danger btn-large",
                             onclick: move |_| {
-                                let (tx, _, _, _, _, _, _, _) = get_global_state();
+                                let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                                 if let Some(ref sender) = tx {
                                     let _ = sender.send(CaptureCommand::StopRecording);
                                 }
@@ -495,7 +745,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                         button {
                             class: "btn btn-secondary",
                             onclick: move |_| {
-                                let (tx, _, _, _, _, _, _, _) = get_global_state();
+                                let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                                 if let Some(ref sender) = tx {
                                     // Cancel recording - will delete file and not upload
                                     let _ = sender.send(CaptureCommand::CancelRecording);
@@ -575,7 +825,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                                     button {
                                         class: "btn btn-secondary btn-action",
                                         onclick: move |_| {
-                                            let (tx, _, _, _, _, _, _, _) = get_global_state();
+                                            let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                                             if let Some(ref sender) = tx {
                                                 let _ = sender.send(CaptureCommand::SelectSource);
                                             }
@@ -591,7 +841,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                         button {
                             class: "btn btn-secondary",
                             onclick: move |_| {
-                                let (tx, _, _, _, _, _, _, _) = get_global_state();
+                                let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                                 if let Some(ref sender) = tx {
                                     let _ = sender.send(CaptureCommand::SelectSource);
                                 }
@@ -608,7 +858,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                     button {
                         class: "btn btn-primary btn-hero",
                         onclick: move |_| {
-                            let (tx, _, _, _, _, _, _, _) = get_global_state();
+                            let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                             if let Some(ref sender) = tx {
                                 let _ = sender.send(CaptureCommand::SelectSource);
                             }
@@ -626,7 +876,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                     button {
                         class: "btn btn-success btn-hero",
                         onclick: move |_| {
-                            let (tx, _, _, _, _, _, _, _) = get_global_state();
+                            let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                             if let Some(ref sender) = tx {
                                 let _ = sender.send(CaptureCommand::StartRecording);
                             }
@@ -637,7 +887,7 @@ fn MainContent(is_capturing: bool, is_recording: bool, source_name: String, reco
                     button {
                         class: "btn btn-text",
                         onclick: move |_| {
-                            let (tx, _, _, _, _, _, _, _) = get_global_state();
+                            let (tx, _, _, _, _, _, _, _, _, _) = get_global_state();
                             if let Some(ref sender) = tx {
                                 // Stop sharing the current source first
                                 let _ = sender.send(CaptureCommand::StopCapture);
